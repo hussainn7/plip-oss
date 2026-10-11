@@ -26,7 +26,7 @@ export const FRAMES: Frame[] = [
       transcript: QUESTION,
       steps: [
         { id: 'look', label: 'Looked at 2 screens', status: 'done', detail: '84ms' },
-        { id: 'route', label: 'Jev: needs screen', status: 'done', detail: '91ms' },
+        { id: 'route', label: 'Needs your screen', status: 'done', detail: '91ms' },
         { id: 'think', label: 'Claude is thinking', status: 'active' },
       ],
     },
@@ -138,10 +138,11 @@ export function applyFrame(frame: Frame) {
 export const DEMO_SETTINGS: Partial<SettingsState> = {
   engines: [
     { id: 'claude-code', label: 'Claude', via: 'Claude Pro / Max via Claude Code', kind: 'subscription', status: 'ready', selected: true, vision: true, detail: 'Signed in as you. Sees screenshots; streams answers.' },
-    { id: 'codex', label: 'ChatGPT', via: 'ChatGPT Plus / Pro via Codex CLI', kind: 'subscription', status: 'logged-out', vision: true, detail: 'Run codex login once and choose Sign in with ChatGPT.', login: 'codex login' },
-    { id: 'cursor', label: 'Cursor', via: 'Your Cursor plan via Cursor CLI', kind: 'subscription', status: 'not-installed', install: 'curl https://cursor.com/install -fsS | bash', detail: 'Text answers; Plip describes the screen for it.' },
-    { id: 'gemini', label: 'Gemini', via: 'Google account via Gemini CLI', kind: 'subscription', status: 'not-installed', install: 'npm i -g @google/gemini-cli' },
+    { id: 'codex', label: 'ChatGPT', via: 'ChatGPT Plus / Pro via Codex CLI', kind: 'subscription', status: 'logged-out', vision: true, detail: 'Connect opens your browser to sign in with your ChatGPT plan.', login: 'codex login' },
+    { id: 'cursor', label: 'Cursor', via: 'Your Cursor plan via Cursor CLI', kind: 'subscription', status: 'not-installed', install: 'curl https://cursor.com/install -fsS | bash', detail: 'Not on this Mac yet: Connect installs it and signs you in.' },
+    { id: 'antigravity', label: 'Gemini', via: 'Google AI Pro / Ultra via Antigravity', kind: 'subscription', status: 'ready', detail: 'Signed in to Antigravity' },
     { id: 'anthropic', label: 'Claude API', via: 'Anthropic API key', kind: 'api', status: 'missing-key', keyName: 'ANTHROPIC_API_KEY', vision: true },
+    { id: 'gemini-api', label: 'Gemini API', via: 'Free key from Google AI Studio', kind: 'api', status: 'missing-key', keyName: 'GEMINI_API_KEY', vision: true, detail: 'Free with a Google account, no AI plan needed. Sees your screenshots.' },
   ],
   permissions: { screen: true, accessibility: true, microphone: true, speech: null },
   voice: { tts: 'elevenlabs', stt: 'assemblyai', elevenlabs: true, assemblyai: false,
@@ -224,7 +225,8 @@ function demoUsage(): UsageState {
 }
 
 export const DEMO_USER = { name: 'Hussain Syed', email: 'hussain@plip.dev', provider: 'google', since: 1789862400 }
+export const DEMO_GUEST = { name: 'Quiet Nomad', email: '', provider: 'anonymous', since: 1789862400 }
 
 export function loadDemoSettings() {
-  settings.set({ ...DEMO_SETTINGS, usage: demoUsage(), account: { available: true, required: false, status: '', user: DEMO_USER } })
+  settings.set({ ...DEMO_SETTINGS, usage: demoUsage(), account: { available: true, identified: true, anonymous: false, prompt: false, status: '', user: DEMO_USER } })
 }

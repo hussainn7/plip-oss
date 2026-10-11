@@ -34,13 +34,16 @@ class _NullPresenter:
 
 class BuddyController:
     FINAL_TIMEOUT = 3.5          # seconds to wait for a transcript after release
+    # seconds held alone before it counts (other apps' ⌃⌥ shortcuts)
+    PRESS_DELAY = 0.15
 
     def __init__(self, *, companion: Any, overlay: Any, loop: asyncio.AbstractEventLoop,
                  call_later: Callable[[float, Callable[[], None]], Any],
                  on_main: Callable[..., Any], listener: Any = None, setup_error: str = "",
                  status: Callable[[str], None] | None = None, say: Callable[[str], None] = _say,
                  presenter: Any = None, on_result: Callable[[str, Any], None] | None = None,
-                 on_setup_needed: Callable[[str], None] | None = None):
+                 on_setup_needed: Callable[[str], None] | None = None, press_delay: float = 0.0,
+                 sound: Callable[[str], None] | None = None):
         self.companion = companion
         self.overlay = overlay
         self.loop = loop
@@ -57,30 +60,93 @@ class BuddyController:
         self.transcript = ""
         self.generation = 0
         self.hotkey_mode = "none"
+        self.shortcut = "Control+Option"     # talk shortcut, in words and in keys
+        self.shortcut_keys = "⌃⌥"
         self.last_result = None
+        self.press_delay = press_delay
+        self.sound = sound or (lambda name: None)
+        self._pressing = 0                   # press number waiting out press_delay, 0 = none
+        self._presses = 0
+        self._early = False                  # mic started at the press
 
     # -- hotkey -------------------------------------------------------------------
     def on_press(self) -> None:
+        if self.press_delay <= 0:
+            self._press()
+            return
+        self._presses += 1
+        self._pressing = press = self._presses
+        self._listen_early()
+        self.call_later(self.press_delay, lambda: self._press(press))
+
+    def _listen_early(self) -> None:
+        # mic on now (first word); hush Plip so it isn't recorded
+        self._early = False
+        if self.setup_error or self.companion is None or self.listener is None or \
+                self.state in {"listening", "finalizing"}:
+            return
+        try:
+            self.listener.start()
+        except Exception:
+            return
+        self._early = True
+        hush = getattr(self.companion, "hush", None)
+        if hush is not None and self.loop is not None:
+            self.loop.call_soon_threadsafe(hush)
+
+    def _drop_early(self) -> None:
+        if self._early:
+            self._early = False
+            self.listener.cancel()
+
+    def _press(self, press: int = 0) -> None:
+        if press:
+            if press != self._pressing:
+                return                       # released, or another key joined: not a request
+            self._pressing = 0
         if self.setup_error or self.companion is None or self.listener is None:
             message = self.setup_error or "Speech input is unavailable."
             self.status("Needs setup: " + message)
-            self.presenter.failed(message)
+            self.presenter.failed(message, True)
             self.say("I need a little setup first. I opened my settings for you.")
             self.on_setup_needed(message)
             return
         self.generation += 1
         self.loop.call_soon_threadsafe(self.companion.interrupt, self.generation)
+        warm = getattr(self.companion, "warm_brain", None)
+        if warm is not None:                         # brain warms while they talk (~0.3 s)
+            self.loop.call_soon_threadsafe(warm)
         self.state = "listening"
         self.transcript = ""
         self.overlay.set_state("listening")
         self.presenter.listening()
         self.status("Listening...")
+        if self._early:                              # mic already on
+            self._early = False
+            return
         try:
             self.listener.start()
         except Exception as exc:
             self._idle(f"Microphone problem: {exc}")
 
+    def ask(self, text: str) -> None:
+        """A button's request (Yes, Keep going), handled as if spoken."""
+        if self.setup_error or self.companion is None:
+            self.presenter.failed(self.setup_error or "I'm still waking up. Try again in a second.", True)
+            return
+        if self.state in {"listening", "finalizing"} and self.listener is not None:
+            self.listener.cancel()
+        self.generation += 1
+        self.loop.call_soon_threadsafe(self.companion.interrupt, self.generation)
+        self.overlay.set_state("thinking")
+        self.presenter.asked(text)
+        self.state = "finalizing"
+        self.on_final(text)
+
     def on_release(self) -> None:
+        if self._pressing:                   # a tap: only stops Plip
+            self.stop()
+            return
         if self.state != "listening":
             return
         self.state = "finalizing"
@@ -90,12 +156,45 @@ class BuddyController:
         self.companion.prefetch()
         self.listener.release()
         generation = self.generation
+        tail = getattr(self.listener, "tail", 0) or 0       # parakeet keeps the mic on a beat longer
+        if tail > 0:
+            self.call_later(tail + 0.02, lambda: self._toss(generation))
+        else:
+            self.sound("sent")                           # mic is off now, so it can't hear it
         self.call_later(self.FINAL_TIMEOUT, lambda: self._final_timeout(generation))
 
+    def _toss(self, generation: int) -> None:
+        if generation == self.generation and self.state != "listening":
+            self.sound("sent")
+
+    def stop(self) -> None:
+        """Stop (island, menu bar, quick tap): whatever Plip is doing, including a pending answer."""
+        self._pressing = 0
+        if self.state in {"listening", "finalizing"} and self.listener is not None:
+            self.listener.cancel()
+        self._drop_early()
+        self.generation += 1
+        if self.companion is not None and self.loop is not None:
+            self.loop.call_soon_threadsafe(self.companion.interrupt, self.generation)
+        self._idle(f"Ready - hold {self.shortcut}")
+        self.presenter.idle()
+        generation = self.generation
+        self.call_later(0.3, lambda: self._settle(generation))
+
+    def _settle(self, generation: int) -> None:
+        # again, once the stopped turn's last updates are in (they could reopen it or leave Plip "speaking")
+        if generation == self.generation and self.state == "idle" and not self._pressing:
+            self.overlay.set_state("idle")
+            self.presenter.idle()
+
     def on_cancel(self) -> None:
+        if self._pressing:                   # another app's shortcut: leave Plip alone
+            self._pressing = 0
+            self._drop_early()
+            return
         if self.state in {"listening", "finalizing"}:
             self.listener.cancel()
-            self._idle("Ready - hold Control+Option")
+            self._idle(f"Ready - hold {self.shortcut}")
             self.presenter.idle()
 
     # -- speech -------------------------------------------------------------------
@@ -116,8 +215,8 @@ class BuddyController:
             return
         text = " ".join((text or "").split())
         if not text:
-            self._idle("Didn't catch that - hold Control+Option and talk")
-            self.presenter.failed("I didn't catch that. Hold ⌃⌥ and try again.")
+            self._idle(f"Didn't catch that - hold {self.shortcut} and talk")
+            self.presenter.failed(f"I didn't catch that. Hold {self.shortcut_keys} and try again.")
             return
         self.state = "responding"
         self.transcript = text
@@ -142,8 +241,8 @@ class BuddyController:
     def _final_timeout(self, generation: int) -> None:
         if generation == self.generation and self.state == "finalizing":
             self.listener.cancel()
-            self._idle("Didn't catch that - hold Control+Option and talk")
-            self.presenter.failed("I didn't catch that. Hold ⌃⌥ and try again.")
+            self._idle(f"Didn't catch that - hold {self.shortcut} and talk")
+            self.presenter.failed(f"I didn't catch that. Hold {self.shortcut_keys} and try again.")
 
     def _finished(self, future, generation: int) -> None:
         if generation != self.generation:

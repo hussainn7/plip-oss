@@ -65,6 +65,25 @@ export function Button({ children, onClick, variant = 'primary', className, disa
   )
 }
 
+/** For irreversible actions: first click asks, second does it. */
+export function ConfirmButton({ children, onConfirm, confirm = 'Clear', size = 'sm', variant = 'quiet' }: {
+  children: React.ReactNode
+  onConfirm: () => void
+  confirm?: string
+  size?: 'sm' | 'md'
+  variant?: 'primary' | 'brand' | 'ghost' | 'quiet' | 'danger'
+}) {
+  const [asking, setAsking] = useState(false)
+  if (!asking) return <Button size={size} variant={variant} onClick={() => setAsking(true)}>{children}</Button>
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className="text-[12px] text-white/55">This can’t be undone.</span>
+      <Button size={size} variant="danger" onClick={() => { setAsking(false); onConfirm() }}>{confirm}</Button>
+      <Button size={size} variant="quiet" onClick={() => setAsking(false)}>Cancel</Button>
+    </span>
+  )
+}
+
 /** A settings list: rows in one card, split by hairlines. */
 export function Rows({ children, className }: { children: React.ReactNode; className?: string }) {
   return <div className={cn('card relative divide-y divide-white/[0.05] overflow-hidden', className)}>{children}</div>
@@ -117,7 +136,7 @@ export function Pill({ tone, children, dot = true }: { tone: Tone; children: Rea
   )
 }
 
-export function Segmented<T extends string>({ value, options, onChange }: { value: T; options: { value: T; label: string }[]; onChange: (value: T) => void }) {
+export function Segmented<T extends string>({ value, options, onChange }: { value: T; options: { value: T; label: string; hint?: string }[]; onChange: (value: T) => void }) {
   const group = options.map((option) => option.value).join()
   return (
     <div className="inline-flex shrink-0 whitespace-nowrap rounded-full bg-black/40 p-1 hairline">
@@ -125,6 +144,8 @@ export function Segmented<T extends string>({ value, options, onChange }: { valu
         <button
           key={option.value}
           onClick={() => onChange(option.value)}
+          title={option.hint}
+          aria-label={option.hint}
           className={cn('relative rounded-full px-3 py-1 text-[12px] font-semibold transition', value === option.value ? 'text-slate-950' : 'text-white/50 hover:text-white/80')}
         >
           {value === option.value && (

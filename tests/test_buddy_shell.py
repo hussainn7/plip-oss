@@ -59,6 +59,11 @@ def test_chord_with_command_is_not_ours_and_key_during_chord_cancels():
     assert events == ["press", "cancel"]
     chord.key_down()                                    # keys outside the chord are ignored
     assert events == ["press", "cancel"]
+    chord.flags_changed(CONTROL | OPTION)              # ⌃⌥ then ⌘ (Rectangle's ⌃⌥⌘→): not ours
+    chord.flags_changed(CONTROL | OPTION | COMMAND)
+    chord.flags_changed(CONTROL | OPTION)
+    chord.flags_changed(0)
+    assert events == ["press", "cancel", "press", "cancel"]
 
 
 # -- speech in ---------------------------------------------------------------------
@@ -406,3 +411,78 @@ def test_backlog_is_flushed_in_order_before_live_audio():
     gate.set()
     assert wait_for(lambda: len([m for m in socket.sent if isinstance(m, bytes)]) == 3)
     assert [m for m in socket.sent if isinstance(m, bytes)] == [b"a1", b"a2", b"live"]
+
+
+def test_every_offered_shortcut_presses_releases_and_ignores_other_apps_shortcuts():
+    from mcp_vision.buddy.hotkey import CHORDS, chord
+
+    assert [chord(name).symbols for name in CHORDS] == ["⌃⌥", "⌥⌘", "⌃⇧", "⌃⌘"]
+    assert chord("option+command").label == "Option + Command" and chord("hyper+f13").id == "control+option"
+    for name in CHORDS:
+        picked = chord(name)
+        chord_, events = detector()
+        chord_.set_chord(picked.mask)
+        chord_.flags_changed(picked.mask | SHIFT if not picked.mask & SHIFT else picked.mask)   # a stray Shift is fine
+        chord_.flags_changed(0)
+        assert events == ["press", "release"], name
+        for extra in (CONTROL, OPTION, COMMAND):           # an extra modifier: another app's shortcut
+            if not picked.mask & extra:
+                chord_.flags_changed(picked.mask | extra)
+                chord_.flags_changed(0)
+        assert events == ["press", "release"], name
+    # old default stops answering
+    chord_, events = detector()
+    chord_.set_chord(chord("option+command").mask)
+    chord_.flags_changed(CONTROL | OPTION)
+    assert events == []
+
+
+def test_changing_the_shortcut_mid_press_drops_that_press():
+    from mcp_vision.buddy.hotkey import chord
+
+    chord_, events = detector()
+    chord_.flags_changed(CONTROL | OPTION)
+    chord_.set_chord(chord("control+shift").mask)
+    chord_.flags_changed(0)
+    assert events == ["press", "cancel"]                # never sent half a question
+
+
+def test_the_listener_only_says_it_works_when_macos_passes_it_keys():
+    from mcp_vision.buddy.hotkey import MacHotkeyListener
+
+    class Listener(MacHotkeyListener):
+        """Real logic minus the Quartz tap (a real one would hear this Mac's keys)."""
+
+        made = 0
+
+        def _start_tap(self):
+            self.made += 1
+            return True
+
+        def _start_monitors(self):
+            return False
+
+        def stop(self):
+            self.mechanism = "none"
+
+    allowed = [False]
+    listener = Listener(ChordDetector(on_press=lambda: None, on_release=lambda: None, on_cancel=lambda: None),
+                        allowed=lambda: allowed[0])
+    # no Accessibility: the tap is made but never gets keys
+    assert listener.start() == "none" and listener.made == 1
+    assert listener.mode() == "none"
+    allowed[0] = True                                   # turned on: re-listen (old tap stays deaf)
+    assert listener.mode() == "event-tap" and listener.made == 2
+    assert listener.mode() == "event-tap" and listener.made == 2
+
+
+def test_it_names_whose_accessibility_the_shortcut_needs(monkeypatch):
+    from mcp_vision.buddy import hotkey
+
+    monkeypatch.setattr(hotkey.sys, "prefix", "/Applications/Plip.app/Contents/Resources/python")
+    assert hotkey.keyboard_owner() == "Plip"
+    monkeypatch.setattr(hotkey.sys, "prefix", "/Users/me/plip/.venv")
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    assert hotkey.keyboard_owner() == "Terminal"
+    monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+    assert hotkey.keyboard_owner() == "iTerm"

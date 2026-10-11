@@ -1,33 +1,28 @@
-import { ArrowRight, Check, Copy, Gauge, Lock, Zap } from 'lucide-react'
-import { useState } from 'react'
-import { send, type Engine, type SettingsState } from '../../bridge'
+import { ArrowRight, Check, Gauge, Plug, RotateCcw, Zap } from 'lucide-react'
+import { send, type Engine, type KeyCheck, type SettingsState } from '../../bridge'
 import { cn } from '../../components/bits'
-import { ConnectAI } from './connect'
+import { EngineMark } from '../../components/marks'
+import { ConnectAI, Connecting } from './connect'
 import { money } from './usage'
 import { Button, Card, Header, KeyField, Pill, Section, Segmented } from './ui'
 
-const ENGINE_GLYPH: Record<string, { bg: string; text: string; glyph: string }> = {
-  'claude-code': { bg: 'bg-[#d97757]', text: 'text-white', glyph: '✳' },
-  codex: { bg: 'bg-white', text: 'text-black', glyph: '◎' },
-  cursor: { bg: 'bg-[#111114] hairline', text: 'text-white', glyph: '▲' },
-  gemini: { bg: 'bg-gradient-to-br from-[#4f7cff] to-[#b46bff]', text: 'text-white', glyph: '✦' },
-  anthropic: { bg: 'bg-[#e8dccf]', text: 'text-[#1f1b16]', glyph: 'A' },
-}
 const STATUS: Record<Engine['status'], [string, 'good' | 'warn' | 'muted']> = {
   ready: ['Ready', 'good'], unknown: ['Checking', 'muted'], 'not-installed': ['Not installed', 'warn'],
-  'logged-out': ['Sign in needed', 'warn'], 'missing-key': ['Add key', 'warn'],
+  'logged-out': ['Sign in needed', 'warn'], 'missing-key': ['Add key', 'warn'], unavailable: ['Unavailable for now', 'muted'],
 }
 
-function EngineCard({ engine }: { engine: Engine }) {
-  const glyph = ENGINE_GLYPH[engine.id] ?? { bg: 'bg-white/10', text: 'text-white', glyph: '•' }
-  const [label, tone] = STATUS[engine.status]
-  const [copied, setCopied] = useState(false)
-  const usable = engine.status === 'ready' || engine.status === 'unknown'
+function EngineCard({ engine, check }: { engine: Engine; check?: KeyCheck | null }) {
+  const connect = engine.connect
+  const busy = connect?.state === 'installing' || connect?.state === 'signing-in'
+  const [label, tone] = busy ? (['Connecting', 'muted'] as const) : STATUS[engine.status]
+  const usable = !busy && (engine.status === 'ready' || engine.status === 'unknown')
+  const manual = engine.id === 'antigravity'          // its own app installs and signs in
+  const canConnect = engine.kind === 'subscription' && !manual && !busy && (engine.status === 'not-installed' || engine.status === 'logged-out')
 
   return (
     <Card active={engine.selected} className="flex flex-col gap-3">
       <div className="flex items-start gap-3">
-        <span className={cn('grid size-10 shrink-0 place-items-center rounded-xl text-[18px] font-bold shadow-lg', glyph.bg, glyph.text)}>{glyph.glyph}</span>
+        <EngineMark id={engine.id} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="truncate text-[14px] font-semibold tracking-tight">{engine.label}</span>
@@ -49,25 +44,21 @@ function EngineCard({ engine }: { engine: Engine }) {
             <Check className="size-4" strokeWidth={3} /> In use
           </span>
         )}
-        {engine.status === 'not-installed' && engine.install && (
-          <Button
-            variant="ghost"
-            onClick={() => {
-              send('copy', { text: engine.install })
-              setCopied(true)
-              window.setTimeout(() => setCopied(false), 1600)
-            }}
-          >
-            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />} {copied ? 'Copied' : 'Copy install command'}
-          </Button>
+        {manual && engine.status === 'not-installed' && (
+          <Button variant="ghost" onClick={() => send('open-url', { url: 'https://antigravity.google' })}>Get Antigravity</Button>
         )}
-        {engine.status === 'logged-out' && (
-          <Button variant="ghost" onClick={() => send('engine-login', { id: engine.id })}>
-            <Lock className="size-3.5" /> Sign in
+        {canConnect && (
+          <Button variant="brand" onClick={() => send('engine-connect', { id: engine.id })}>
+            {connect?.state === 'failed' ? <RotateCcw className="size-3.5" /> : <Plug className="size-3.5" />}
+            {connect?.state === 'failed' ? 'Try again' : `Connect ${engine.label}`}
           </Button>
         )}
       </div>
+      {connect && (busy || connect.state === 'failed') && <Connecting id={engine.id} progress={connect} />}
       {engine.status === 'missing-key' && engine.keyName && <KeyField name={engine.keyName} placeholder={`Paste ${engine.keyName}`} saved={false} />}
+      {check && check.state !== 'ok' && (
+        <div className={cn('text-[12px]', check.state === 'bad' ? 'text-rose-200/90' : 'text-white/55')}>{check.message}</div>
+      )}
     </Card>
   )
 }
@@ -79,9 +70,10 @@ export function BrainTab({ state }: { state: SettingsState }) {
     <div>
       <Header
         eyebrow="Brain"
-        title="Use the AI you already pay for"
-        subtitle="Plip thinks with your Claude, ChatGPT, Cursor or Gemini plan through their official command-line apps, with their tools switched off. No extra bill. Or paste an API key."
+        title="The AI Plip thinks with"
+        subtitle="Use the plan you already pay for (Claude, ChatGPT or Cursor): one click connects it, with no extra bill. No plan? Google’s Gemini is free."
       />
+      <p className="-mt-4 mb-5 text-[11.5px] text-white/35">How fast answers come depends on the provider.</p>
       <div className="mb-6"><ConnectAI state={state} /></div>
       {state.usage && state.usage.periods['30'].requests > 0 && (
         <a href="#settings?tab=activity" className="card card-hover mb-6 flex items-center gap-3 px-4 py-3 text-[12.5px] text-white/60">
@@ -90,11 +82,13 @@ export function BrainTab({ state }: { state: SettingsState }) {
           <span className="ml-auto inline-flex items-center gap-1 font-semibold text-white/80">See usage <ArrowRight className="size-3.5" /></span>
         </a>
       )}
-      <Section title="Or pick one yourself">
+      <Section title="Your subscriptions">
         <div className="grid grid-cols-2 gap-3">{plans.map((engine) => <EngineCard key={engine.id} engine={engine} />)}</div>
       </Section>
       <Section title="API keys">
-        <div className="grid grid-cols-2 gap-3">{keys.map((engine) => <EngineCard key={engine.id} engine={engine} />)}</div>
+        <div className="grid grid-cols-2 gap-3">
+          {keys.map((engine) => <EngineCard key={engine.id} engine={engine} check={state.keyCheck?.name === engine.keyName ? state.keyCheck : null} />)}
+        </div>
       </Section>
       <div className="grid grid-cols-2 gap-3">
         <Card>

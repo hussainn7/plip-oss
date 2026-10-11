@@ -7,7 +7,11 @@ from typing import Any
 
 
 class ActionError(RuntimeError):
-    """The action ran but couldn't do what was asked; the message is spoken."""
+    """The action ran but couldn't do what was asked; the message is spoken. ``hint``: model-only next try."""
+
+    def __init__(self, message: str, hint: str = ""):
+        super().__init__(message)
+        self.hint = hint
 
 
 @dataclass
@@ -18,6 +22,7 @@ class Preview:
     lines: list[str] = field(default_factory=list)
     confirm: str = "Do it"                  # button label
     state: Any = None                       # whatever run() needs (e.g. the computed move plan)
+    firm: bool = False                      # card asks its own question: a spoken yes never covers it
 
 
 @dataclass
@@ -26,6 +31,9 @@ class ActionResult:
     say: str = ""                           # spoken after the action when the model didn't cover it
     report: str = ""                        # handed to the model in a follow-up turn
     look_after: float | None = None         # take a fresh look this many seconds later
+    settle: float | None = None             # screen changing: wait up to this long for the map to settle
+    opens: bool = False                     # opened a link/page/app: rarely the task's end
+    note: str = ""                          # for the model next, without another turn
     detail: str = ""                        # one line for the island step
     items: list[dict] = field(default_factory=list)    # results to list in the island
     undo: dict | None = None                # how to reverse it (kept by the engine)
@@ -42,6 +50,12 @@ class ActionContext:
     schedule: Callable[[float, Callable[[], None]], Any] = lambda delay, fn: None
     screen: Any = None                                         # last screenshots/context, for forms
     observe: Callable[[], Any] = lambda: None                  # a fresh screen map now (no screenshot, no tokens)
+    # frontmost page's full text as lines, scrolled-out parts too
+    read: Callable[[], list[str]] = lambda: []
+    # tiny gray thumbnail around a point: a scroll can tell it moved where the map can't
+    fingerprint: Callable[[float, float], bytes | None] = lambda x, y: None
+    # bumped per new request, so a cut-off long scroll stops
+    generation: int = 0
     animate: Callable[[float, float, str], Any] = lambda x, y, label: None   # Plip flies to where it acts
 
 

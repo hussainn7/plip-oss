@@ -1,36 +1,229 @@
-import { Check, Sparkles } from 'lucide-react'
-import { send, type SettingsState } from '../../bridge'
-import { Button } from './ui'
+import { Check, ExternalLink, LoaderCircle, Plug, RotateCcw } from 'lucide-react'
+import { useState } from 'react'
+import { send, type ConnectProgress, type Engine, type SettingsState } from '../../bridge'
+import { cn } from '../../components/bits'
+import { EngineMark } from '../../components/marks'
+import { Button, Card, Input, Pill } from './ui'
 
-/** One button to get a working AI: picks a ready one, or signs in, or installs Claude and signs in. */
+export const GOOGLE_KEY_PAGE = 'https://aistudio.google.com/apikey'
+
+/** The plans people pay for, in words they'd use. */
+const PLANS: { id: string; plan: string }[] = [
+  { id: 'claude-code', plan: 'Claude Pro or Max' },
+  { id: 'codex', plan: 'ChatGPT Plus or Pro' },
+  { id: 'antigravity', plan: 'Google AI Pro or Ultra' },
+  { id: 'cursor', plan: 'Cursor' },
+]
+
+/** Pick an AI: a paid plan (one-click connect) or free Google. */
 export function ConnectAI({ state, compact = false }: { state: SettingsState; compact?: boolean }) {
   const engine = state.engines.find((item) => item.selected)
   const ready = engine?.status === 'ready'
+  const [choosing, setChoosing] = useState(false)
+
+  if (ready && !choosing) {
+    return (
+      <Card className="flex items-center gap-4">
+        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-mint/10 text-emerald-300 hairline"><Check className="size-4" strokeWidth={3} /></span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[14px] font-semibold tracking-tight">Plip thinks with {engine!.label}</div>
+          <div className="truncate text-[12px] text-white/45">{engine!.detail || engine!.via}</div>
+        </div>
+        <Button variant="quiet" onClick={() => setChoosing(true)}>Change</Button>
+      </Card>
+    )
+  }
+
+  const plans = PLANS.map(({ id, plan }) => ({ engine: state.engines.find((item) => item.id === id), plan }))
+    .filter((item): item is { engine: Engine; plan: string } => Boolean(item.engine))
   return (
-    <div className={compact ? '' : 'card p-5'}>
+    <div className="space-y-3">
+      {!compact && (
+        <div>
+          <div className="text-[14px] font-semibold tracking-tight">Connect an AI</div>
+          <div className="mt-0.5 text-[12.5px] text-white/45">Plip needs an AI to think with. Use one you already pay for, or a free one from Google.</div>
+        </div>
+      )}
+      <Card className="divide-y divide-white/[0.05] p-0">
+        <div className="px-5 pb-2 pt-3.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/35">If you pay for one of these</div>
+        {plans.map(({ engine: item, plan }) => <PlanRow key={item.id} engine={item} plan={plan} />)}
+      </Card>
+      <FreeGoogleKey state={state} />
+      {ready && <Button variant="quiet" onClick={() => setChoosing(false)}>Keep {engine!.label}</Button>}
+    </div>
+  )
+}
+
+function PlanRow({ engine, plan }: { engine: Engine; plan: string }) {
+  const connect = engine.connect
+  const busy = connect?.state === 'installing' || connect?.state === 'signing-in'
+  const usable = !busy && (engine.status === 'ready' || engine.status === 'unknown')
+  const manual = engine.id === 'antigravity'          // its own app installs and signs in
+  const canConnect = !manual && !busy && (engine.status === 'not-installed' || engine.status === 'logged-out')
+  return (
+    <div className="px-5 py-3">
       <div className="flex items-center gap-4">
-        <div className="flex-1">
-          <div className="text-[14px] font-semibold">{ready ? `Connected to ${engine!.label}` : 'Connect your AI'}</div>
+        <EngineMark id={engine.id} size={36} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[13.5px] font-semibold tracking-tight">{engine.label}</div>
+          <div className="truncate text-[12px] text-white/45">{manual && engine.status === 'logged-out' ? engine.detail : plan}</div>
+        </div>
+        {engine.selected && usable ? (
+          <span className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-emerald-300"><Check className="size-4" strokeWidth={3} /> In use</span>
+        ) : usable ? (
+          <Button variant="ghost" onClick={() => send('select-engine', { id: engine.id })}>Use {engine.label}</Button>
+        ) : manual && engine.status === 'not-installed' ? (
+          <Button variant="ghost" onClick={() => send('open-url', { url: 'https://antigravity.google' })}>Get Antigravity</Button>
+        ) : canConnect ? (
+          <Button variant="brand" onClick={() => send('engine-connect', { id: engine.id })}>
+            {connect?.state === 'failed' ? <RotateCcw className="size-3.5" /> : <Plug className="size-3.5" />}
+            {connect?.state === 'failed' ? 'Try again' : 'Connect'}
+          </Button>
+        ) : null}
+      </div>
+      {connect && (busy || connect.state === 'failed') && <div className="mt-3"><Connecting id={engine.id} progress={connect} /></div>}
+    </div>
+  )
+}
+
+/** No AI plan: a free Gemini key in three steps. */
+export function FreeGoogleKey({ state }: { state: SettingsState }) {
+  const gemini = state.engines.find((item) => item.id === 'gemini-api')
+  const check = state.keyCheck && (state.keyCheck.name === 'GEMINI_API_KEY' || !state.keyCheck.name) ? state.keyCheck : null
+  const [typing, setTyping] = useState(false)
+  const [value, setValue] = useState('')
+  if (!gemini) return null
+  const ready = gemini.status === 'ready'
+
+  return (
+    <Card>
+      <div className="flex items-start gap-4">
+        <EngineMark id="gemini-api" size={36} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[13.5px] font-semibold tracking-tight">No AI plan? Use Google’s for free</span>
+            <Pill tone="good" dot={false}>Free</Pill>
+          </div>
           <div className="mt-0.5 text-[12px] leading-relaxed text-white/45">
-            {ready
-              ? engine!.detail || engine!.via
-              : 'One click. Plip uses the Claude, ChatGPT, Cursor or Gemini plan you already have, or sets up Claude for you.'}
+            Gemini, from Google. All you need is a Google account, like the one you use for Gmail. Takes about a minute.
           </div>
         </div>
-        {ready ? (
-          <span className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-emerald-300">
-            <Check className="size-4" strokeWidth={3} /> Ready
-          </span>
-        ) : (
-          <Button variant="brand" onClick={() => send('quick-connect')}>
-            <Sparkles className="size-3.5" /> Connect AI
-          </Button>
+        {ready && gemini.selected && (
+          <span className="inline-flex shrink-0 items-center gap-1.5 text-[12.5px] font-semibold text-emerald-300"><Check className="size-4" strokeWidth={3} /> In use</span>
         )}
+        {ready && !gemini.selected && <Button variant="ghost" onClick={() => send('select-engine', { id: 'gemini-api' })}>Use Gemini</Button>}
       </div>
-      {state.connect && !ready && (
-        <div className="mt-3 flex items-center justify-between gap-3 rounded-xl bg-white/[0.04] px-3 py-2 text-[12px] text-white/60 hairline">
-          <span>{state.connect}</span>
-          <Button variant="quiet" size="sm" onClick={() => send('refresh')}>Check again</Button>
+      {!ready && (
+        <>
+          <ol className="mt-4 space-y-2 text-[12.5px] text-white/65">
+            <li className="flex gap-2.5"><Step n={1} /><span>Click <b className="font-semibold text-white/85">Get my free key</b>. Google’s page opens; sign in with your Google account.</span></li>
+            <li className="flex gap-2.5"><Step n={2} /><span>Click <b className="font-semibold text-white/85">Create API key</b>, then copy the key it shows you.</span></li>
+            <li className="flex gap-2.5"><Step n={3} /><span>Come back here and click <b className="font-semibold text-white/85">Paste key</b>.</span></li>
+          </ol>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <Button variant="brand" onClick={() => send('open-url', { url: GOOGLE_KEY_PAGE })}>Get my free key <ExternalLink className="size-3.5" /></Button>
+            <Button onClick={() => send('paste-key')}>Paste key</Button>
+            {!typing && (
+              <button className="ml-1 text-[12px] text-white/40 underline-offset-2 hover:text-white/70 hover:underline" onClick={() => setTyping(true)}>
+                or type it in
+              </button>
+            )}
+          </div>
+          {typing && (
+            <form
+              className="mt-3 flex items-center gap-2"
+              onSubmit={(event) => {
+                event.preventDefault()
+                if (!value.trim()) return
+                send('set-key', { name: 'GEMINI_API_KEY', value: value.trim() })
+                setValue('')
+              }}
+            >
+              <Input type="password" value={value} onChange={setValue} placeholder="Your Google key (starts with AQ. or AIza)" className="font-mono" />
+              <Button disabled={!value.trim()}>Save</Button>
+            </form>
+          )}
+        </>
+      )}
+      {check && (
+        <div className={cn('mt-3 flex items-center gap-2 text-[12px]', check.state === 'bad' ? 'text-rose-200/90' : check.state === 'ok' ? 'text-emerald-300' : 'text-white/60')}>
+          {check.state === 'checking' && <LoaderCircle className="size-3.5 animate-spin text-plip-300" />}
+          {check.state === 'ok' && <Check className="size-3.5" strokeWidth={3} />}
+          <span>{check.state === 'ok' ? 'Google took the key. You’re connected.' : check.message}</span>
+        </div>
+      )}
+      <div className="mt-3 text-[11.5px] leading-relaxed text-white/35">
+        {ready ? 'The free version has limits (a few questions a minute, more each day), plenty for everyday use. ' : ''}
+        On the free version, Google may use what Plip sends it (screenshots included) to improve its products, and its
+        reviewers may read it. For private work, use a paid plan above.
+      </div>
+    </Card>
+  )
+}
+
+function Step({ n }: { n: number }) {
+  return <span className="grid size-5 shrink-0 place-items-center rounded-full bg-white/[0.07] text-[10.5px] font-bold text-white/60">{n}</span>
+}
+
+/** The sign-in link, to open here or to copy into any browser they like (a failed sign-in keeps it). */
+function LinkActions({ url, className, muted = false }: { url: string; className?: string; muted?: boolean }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    send('copy', { text: url })
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1600)
+  }
+  const tone = muted ? 'text-rose-100/80 hover:text-white' : 'font-semibold text-plip-200 hover:text-plip-100'
+  return (
+    <div className={cn('flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px]', className)}>
+      <button className={tone} onClick={() => send('open-url', { url })}>Open the sign-in page</button>
+      <span className={muted ? 'text-rose-100/30' : 'text-white/20'}>·</span>
+      <button className={tone} onClick={copy}>{copied ? 'Copied' : 'Copy link'}</button>
+      <span className={muted ? 'text-rose-100/50' : 'text-white/35'}>Paste it in any browser you like.</span>
+    </div>
+  )
+}
+
+/** Progress while a brain's app installs and signs in. */
+export function Connecting({ id, progress }: { id: string; progress: ConnectProgress }) {
+  const [help, setHelp] = useState(false)
+  const [code, setCode] = useState('')
+  if (progress.state === 'failed')
+    return (
+      <div className="rounded-xl bg-coral/[0.08] px-3 py-2 text-[12px] leading-relaxed text-rose-200/90">
+        {progress.message}
+        {progress.url && <LinkActions url={progress.url} className="mt-1.5" muted />}
+      </div>
+    )
+  return (
+    <div className="rounded-xl bg-white/[0.04] px-3 py-2.5 hairline">
+      <div className="flex items-center gap-2 text-[12.5px] text-white/80">
+        <LoaderCircle className="size-3.5 shrink-0 animate-spin text-plip-300" />
+        <span className="flex-1">{progress.message}</span>
+        <Button variant="quiet" size="sm" onClick={() => send('engine-connect-cancel', { id })}>Cancel</Button>
+      </div>
+      {progress.state === 'signing-in' && progress.needsCode && (
+        <form
+          className="mt-2 flex items-center gap-2 pl-5.5"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (code.trim()) send('engine-connect-code', { id, code: code.trim() })
+            setCode('')
+          }}
+        >
+          <Input value={code} onChange={setCode} placeholder="If the page shows a code, paste it here" className="font-mono text-[11.5px]" />
+          <Button size="sm" disabled={!code.trim()}>Done</Button>
+        </form>
+      )}
+      {progress.state === 'signing-in' && progress.url && (
+        <div className="mt-1.5 pl-5.5 text-[11.5px] text-white/40">
+          {!help ? (
+            <button className="underline decoration-white/20 underline-offset-2 hover:text-white/70" onClick={() => setHelp(true)}>
+              Browser didn’t open?
+            </button>
+          ) : (
+            <LinkActions url={progress.url} />
+          )}
         </div>
       )}
     </div>

@@ -11,6 +11,9 @@ screen when omitted). It can also act and plan::
 
     [DO:open_app {"name": "Safari"}]
     [PLAN: open settings | pick privacy | turn on two-factor]
+    [GOAL: find remote backend jobs on linkedin]
+
+``[GOAL:...]`` opens a multi-step task that runs until ``[DONE]``.
 
 Action arguments are JSON and may contain brackets, so ``[DO:`` tags are
 scanned with a JSON-aware matcher. Tags never reach the speech engine. Each tag is
@@ -41,6 +44,12 @@ _MAX_TAG_LEN = 200
 _MAX_ACTION_LEN = 6000               # fill_form tags carry every field
 _ACTION_HEAD_RE = re.compile(r"\[\s*DO\s*:\s*(?P<name>[a-z][a-z_]{1,40})\s*", re.IGNORECASE)
 _PLAN_RE = re.compile(r"\[\s*PLAN\s*:(?P<steps>[^\[\]]*)\]", re.IGNORECASE)
+_GOAL_RE = re.compile(r"\[\s*GOAL\s*:(?P<goal>[^\[\]]*)\]", re.IGNORECASE)
+# tool-call markup written as text: it never ran, never spoken
+_LEAK_RE = re.compile(r"<\s*(?:[\w-]+:)?(?:function_calls\s*>|invoke\s+name\s*=|parameter\s+name\s*=|"
+                      r"tool_(?:use|call|code)\b)", re.IGNORECASE)
+_THINKING_RE = re.compile(r"<\s*thinking\s*>", re.IGNORECASE)
+_THINKING_END_RE = re.compile(r"<\s*/\s*thinking\s*>", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -77,7 +86,12 @@ class PlanTag:
     steps: tuple[str, ...]
 
 
-Event = SpeechChunk | PointTag | StepsTag | DoneTag | ActionTag | PlanTag
+@dataclass(frozen=True)
+class GoalTag:
+    text: str
+
+
+Event = SpeechChunk | PointTag | StepsTag | DoneTag | ActionTag | PlanTag | GoalTag
 
 
 def _balanced_end(raw: str) -> int | None:
@@ -93,13 +107,13 @@ def _balanced_end(raw: str) -> int | None:
     return None
 
 
-def scan_special(raw: str) -> tuple[int, ActionTag | PlanTag | None] | None:
-    """Match a ``[DO:...]`` or ``[PLAN:...]`` tag at the start of ``raw``.
+def scan_special(raw: str) -> tuple[int, ActionTag | PlanTag | GoalTag | None] | None:
+    """Match a ``[DO:...]``, ``[PLAN:...]`` or ``[GOAL:...]`` tag at the start of ``raw``.
 
     Returns ``(length consumed, tag)``; the tag is ``None`` when malformed (it is
     dropped, never spoken). Returns ``None`` when more text is needed.
     """
-    head = raw[:7].upper().replace(" ", "")
+    head = raw[:12].upper().replace(" ", "")              # "[ GOAL : …" too
     if head.startswith("[PLAN:"):
         match = _PLAN_RE.match(raw)
         if match is None:
@@ -109,6 +123,13 @@ def scan_special(raw: str) -> tuple[int, ActionTag | PlanTag | None] | None:
             return close + 1, None
         steps = tuple(step.strip(" .") for step in match.group("steps").split("|") if step.strip(" ."))[:10]
         return match.end(), (PlanTag(steps) if steps else None)
+    if head.startswith("[GOAL:"):
+        match = _GOAL_RE.match(raw)
+        if match is None:
+            end = _balanced_end(raw)
+            return (end, None) if end is not None else None
+        goal = " ".join(match.group("goal").split()).strip(" .")[:200]
+        return match.end(), (GoalTag(goal) if goal else None)
     match = _ACTION_HEAD_RE.match(raw)
     if match is None:
         if len(raw) < 12 and "]" not in raw:
@@ -156,6 +177,12 @@ def scan_special(raw: str) -> tuple[int, ActionTag | PlanTag | None] | None:
                     return end + stripped + 1, None
                 return end + stripped + 1, (ActionTag(name, args) if isinstance(args, dict) else None)
     return None
+
+
+def _next_special(raw: str) -> int:
+    """Where the next tag ("[") or markup ("<") might start, or -1."""
+    found = [index for index in (raw.find("["), raw.find("<")) if index != -1]
+    return min(found) if found else -1
 
 
 def parse_tag(raw: str) -> PointTag | None:
@@ -209,23 +236,40 @@ class ReplyStream:
         self.done = False                  # set by [DONE]
         self.actions: list[ActionTag] = []
         self.plan: tuple[str, ...] = ()
+        self.goal = ""                     # set by [GOAL: ...]
+        self.leaked = False                # wrote a tool call as text: mute from here
+        self._thinking = False             # in a long <thinking>: mute till it closes
 
     @property
     def spoken_text(self) -> str:
         return " ".join(self.spoken)
 
     def feed(self, delta: str) -> list[Event]:
+        if self.leaked:
+            return []                                # it's waiting on a tool result: say nothing
         raw, self._raw = self._raw + delta, ""
+        if self._thinking:
+            end = _THINKING_END_RE.search(raw)
+            if end is None:
+                self._raw = raw[-24:]                # closing tag may straddle chunks
+                return []
+            raw, self._thinking = raw[end.end():], False
         events: list[Event] = []
         while raw:
-            start = raw.find("[")
+            start = _next_special(raw)
             if start == -1:
                 self._text += raw
                 break
             self._text += raw[:start]
             raw = raw[start:]
-            special = raw[:7].upper().replace(" ", "")
-            if special.startswith(("[DO:", "[PLAN:")):
+            if raw[0] == "<":
+                rest = self._angle(raw, events)
+                if rest is None:
+                    break                            # may still become markup: wait
+                raw = rest
+                continue
+            special = raw[:12].upper().replace(" ", "")
+            if special.startswith(("[DO:", "[PLAN:", "[GOAL:")):
                 scanned = scan_special(raw)
                 if scanned is None:
                     if len(raw) > _MAX_ACTION_LEN:       # runaway tag: drop it
@@ -239,12 +283,17 @@ class ReplyStream:
                     events.extend(self._release(merge=False))
                     if isinstance(tag, ActionTag):
                         self.actions.append(tag)
+                    elif isinstance(tag, GoalTag):
+                        self.goal = tag.text
                     else:
                         self.plan = tag.steps
                     events.append(tag)
                 continue
             end = raw.find("]")
             inner = raw.find("[", 1)
+            leak = _LEAK_RE.search(raw, 1)
+            if leak is not None and (inner == -1 or leak.start() < inner):
+                inner = leak.start()                 # "[note <invoke …": markup wins
             if inner != -1 and (end == -1 or inner < end):
                 # "array[0 ... [POINT:..]": the first bracket never closed, so it
                 # is prose; restart at the next bracket so the tag still parses.
@@ -285,19 +334,49 @@ class ReplyStream:
     def close(self) -> list[Event]:
         """Flush everything left at the end of the stream."""
         events: list[Event] = []
+        if self._thinking:
+            self._raw = ""                           # unclosed <thinking>: drop it
         for _ in range(32):
             leftover, self._raw = self._raw, ""
             if not leftover:
                 break
-            if not re.match(r"\[\s*(?:POINT|STEPS|DONE|DO|PLAN)\b", leftover, re.IGNORECASE):
+            if leftover[0] == "<":
+                rest = self._angle(leftover, events, final=True)
+                if rest:
+                    events.extend(self.feed(rest))
+                continue
+            if not re.match(r"\[\s*(?:POINT|STEPS|DONE|DO|PLAN|GOAL)\b", leftover, re.IGNORECASE):
                 self._text += leftover
                 break
-            if re.match(r"\[\s*(?:DO|PLAN)\b", leftover, re.IGNORECASE) and "]" in leftover:
+            if re.match(r"\[\s*(?:DO|PLAN|GOAL)\b", leftover, re.IGNORECASE) and "]" in leftover:
                 # A broken action tag: drop it and parse whatever came after it.
                 events.extend(self.feed(leftover[leftover.find("]") + 1:]))
                 continue
             break                                    # a truncated tag with nothing after it: drop it
         return events + self._release(final=True)
+
+    def _angle(self, raw: str, events: list[Event], *, final: bool = False) -> str | None:
+        """Leading ``<``: leaked tool call, <thinking> block, or prose ("a < b")."""
+        if _THINKING_RE.match(raw):
+            end = _THINKING_END_RE.search(raw)
+            if end is not None:
+                return raw[end.end():]
+            if final:
+                return ""
+            if len(raw) > _MAX_ACTION_LEN:           # long: stop buffering, stay quiet till it closes
+                self._thinking, self._raw = True, raw[-24:]
+                return ""
+            self._raw = raw
+            return None
+        if _LEAK_RE.match(raw):
+            events.extend(self._release(merge=False))  # speech before the markup still counts
+            self.leaked = True
+            return ""
+        if not final and len(raw) < 48 and ">" not in raw and "\n" not in raw:
+            self._raw = raw                             # could still turn into markup
+            return None
+        self._text += raw[0]
+        return raw[1:]
 
     def _release(self, *, final: bool = False, merge: bool = True) -> list[Event]:
         if final:

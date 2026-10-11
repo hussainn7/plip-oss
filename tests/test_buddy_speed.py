@@ -28,20 +28,20 @@ def plip(context, **kw):
 def test_it_looks_as_soon_as_the_screen_map_stops_changing():
     page = Loading(changes=4)
     started = time.perf_counter()
-    assert asyncio.run(plip(page)._settle(5.0)) is True
-    assert time.perf_counter() - started < 1.0 and page.reads == 6        # 4 changes, then 2 quiet reads
+    assert asyncio.run(plip(page)._settle(5.0)) == page.snapshot().signature()
+    assert time.perf_counter() - started < 1.0 and page.reads == 7        # 4 changes, 2 quiet reads (+1 here)
 
 
 def test_a_screen_that_keeps_changing_waits_out_the_limit():
     page = Loading(changes=10_000)
     started = time.perf_counter()
-    assert asyncio.run(plip(page)._settle(0.3)) is False
+    assert asyncio.run(plip(page)._settle(0.3)) is not None             # what it ended on, never settled
     assert 0.3 <= time.perf_counter() - started < 1.0
 
 
 def test_without_a_screen_map_it_only_waits_a_moment():
     started = time.perf_counter()
-    assert asyncio.run(plip(None)._settle(0.2)) is False
+    assert asyncio.run(plip(None)._settle(0.2)) is None
     assert time.perf_counter() - started < 0.5
 
 
@@ -118,3 +118,22 @@ def test_sentence_two_is_synthesized_while_sentence_one_plays():
     asyncio.run(asyncio.wait_for(speaker.drain(), 5))
     assert log.index(("prepare", "Two.")) < log.index(("play", "One."))
     assert [entry for entry in log if entry[0] == "play"] == [("play", "One."), ("play", "Two.")]
+
+
+def test_the_screen_map_is_read_at_key_release_too():
+    reads = []
+
+    class Page:
+        def snapshot(self):
+            reads.append(time.perf_counter())
+            return ScreenContext(app="Safari", controls=[Control("Buy", "AXButton", 10, 10)])
+
+    brain = ScriptedBrain("It's top left.")
+    companion = plip(Page())
+    companion.brain = brain
+    released = time.perf_counter()
+    companion.prefetch()                                   # key release
+    time.sleep(0.3)                                        # last words still being finalized
+    asyncio.run(companion.respond("where's buy"))
+    assert len(reads) == 1 and reads[0] - released < 0.2  # walked once, at release
+    assert "Buy | AXButton" in brain.calls[0][-1].text

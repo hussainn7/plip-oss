@@ -72,6 +72,44 @@ def _mss_grab(monitor: dict[str, int]) -> Image.Image:
         return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
+def _screen_grab(monitor: dict[str, int]) -> Image.Image:
+    """The screen as the user sees it, minus Plip's own floating windows (macOS)."""
+    if sys.platform == "darwin":
+        try:
+            image = _mac_grab(monitor)
+            if image is not None:
+                return image
+        except Exception:
+            pass
+    return _mss_grab(monitor)
+
+
+def _mac_grab(monitor: dict[str, int]) -> Image.Image | None:
+    """Every on-screen window but Plip's island, mascot and guide (they stay visible to recordings)."""
+    import os
+
+    import Quartz
+
+    infos = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []
+    pid, ids, own = os.getpid(), [], False
+    for info in infos:
+        if int(info.get(Quartz.kCGWindowOwnerPID, -1)) == pid and int(info.get(Quartz.kCGWindowLayer, 0)) != 0:
+            own = True                                # a floating Plip window: leave it out
+        else:
+            ids.append(int(info[Quartz.kCGWindowNumber]))
+    if not own:
+        return None                                   # nothing of ours on screen: plain grab
+    rect = Quartz.CGRectMake(monitor["left"], monitor["top"], monitor["width"], monitor["height"])
+    options = (Quartz.kCGWindowImageBoundsIgnoreFraming | Quartz.kCGWindowImageShouldBeOpaque
+               | Quartz.kCGWindowImageNominalResolution)  # same as mss
+    image = Quartz.CGWindowListCreateImageFromArray(rect, ids, options)
+    if image is None:
+        return None
+    width, height = Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image)
+    data = bytes(Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(image)))
+    return Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", Quartz.CGImageGetBytesPerRow(image), 1)
+
+
 def _mss_monitors() -> list[dict[str, int]]:
     import mss
 
@@ -95,7 +133,7 @@ class ScreenCapturer:
         self.max_edge = max_edge
         self.quality = quality
         self._monitors = monitors or _mss_monitors
-        self._grab = grabber or _mss_grab
+        self._grab = grabber or _screen_grab
         self._cursor = cursor or cursor_position
         self._scales = scale_factors or (_mac_scale_factors if sys.platform == "darwin" else dict)
 
@@ -134,12 +172,32 @@ class ScreenCapturer:
         image.save(buffer, format="JPEG", quality=self.quality, optimize=True)
         return Screenshot(screen=screen, data=buffer.getvalue(), width=width, height=height)
 
+    def glance(self) -> Image.Image:
+        """The cursor screen right now, unencoded."""
+        screen = order_cursor_first(self.screens())[0]
+        return self._grab(self._monitor_for(screen))
+
     def fingerprint(self) -> bytes:
         """A tiny grayscale thumbnail of the cursor screen for change detection."""
         from mcp_vision.buddy.watch import fingerprint
 
         screen = order_cursor_first(self.screens())[0]
         return fingerprint(self._grab(self._monitor_for(screen)))
+
+    def fingerprint_at(self, x: float, y: float, size: float = 300.0) -> bytes | None:
+        """Fingerprint of the ``size``-pt square around a global point (~16 ms); None off-screen."""
+        from mcp_vision.buddy.watch import fingerprint
+
+        for monitor in self._monitors():
+            left, top, width, height = (float(monitor[key]) for key in ("left", "top", "width", "height"))
+            if not Rect(left, top, width, height).contains(x, y):
+                continue
+            side_x, side_y = min(size, width), min(size, height)
+            box = {"left": int(max(left, min(x - side_x / 2, left + width - side_x))),
+                   "top": int(max(top, min(y - side_y / 2, top + height - side_y))),
+                   "width": int(side_x), "height": int(side_y)}
+            return fingerprint(self._grab(box))
+        return None
 
     @classmethod
     def from_images(cls, paths: list[str], **options) -> ScreenCapturer:

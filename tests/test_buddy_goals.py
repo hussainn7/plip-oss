@@ -1,0 +1,371 @@
+"""Multi-step tasks: [GOAL]…[DONE], failures handed back, [DONE] checked, x,y clicks guarded."""
+from __future__ import annotations
+
+import asyncio
+
+from buddy_fakes import Capturer, FakeHost, ScriptedBrain, Speaker
+from mcp_vision.buddy.actions import ActionContext, ActionEngine
+from mcp_vision.buddy.companion import CONTINUE_RE, Companion
+from mcp_vision.buddy.pointing import GoalTag, ReplyStream, SpeechChunk
+from mcp_vision.buddy.router import rule_route
+from mcp_vision.buddy.screen_context import Control, ScreenContext
+
+
+class Spotify(FakeHost):
+    """Open shows the window; Play starts music; Buy does nothing."""
+
+    def __init__(self, play_works=True):
+        super().__init__()
+        self.open_now, self.playing, self.play_works = False, False, play_works
+
+    def open_app(self, path):
+        super().open_app(path)
+        self.open_now = True
+
+    def click(self, x, y, button="left", count=1):
+        self.calls.append(("click", round(x), round(y)))
+        if self.play_works and (round(x), round(y)) == (300, 200):
+            self.playing = True
+
+    def snapshot(self):
+        if not self.open_now:
+            return ScreenContext(app="Finder", controls=[Control("New Folder", "button", 50, 50)])
+        controls = [Control("Discover Weekly", "link", 300, 150), Control("Play", "button", 300, 200),
+                    Control("Buy now", "button", 600, 400)]
+        if self.playing:
+            controls.append(Control("Pause", "button", 300, 260))
+        return ScreenContext(app="Spotify", window="Discover Weekly", controls=controls)
+
+
+def buddy(host, *replies, **kw):
+    brain = ScriptedBrain(*replies)
+    speaker = Speaker()
+    companion = Companion(brain=brain, capturer=Capturer(), context=host, speaker=speaker,
+                          actions=ActionEngine(ActionContext(host=host)), settle_interval=0.01, **kw)
+    return companion, brain, speaker
+
+
+def test_a_goal_keeps_going_after_the_open_until_done():
+    host = Spotify()
+    companion, brain, _ = buddy(host,
+                                '[GOAL: play discover weekly] opening spotify. [DO:open_app {"name": "spotify"}]',
+                                'hitting play. [DO:click {"id": 2}] playing it now. [DONE]')
+    result = asyncio.run(companion.respond("open spotify and play my discover weekly"))
+    assert host.playing and result.finished and result.turns == 2 and result.outcome == "done"
+    step = brain.calls[1][-1].text
+    assert "(step 1 toward: play discover weekly" in step and "open_app: done" in step
+    assert result.goal == "play discover weekly" and companion._goal == ""          # finished: the task is closed
+
+
+def test_a_failed_step_goes_back_to_the_model_with_a_hint_and_isnt_said_twice():
+    host = Spotify()
+    host.open_now = True
+    companion, brain, speaker = buddy(host,
+                                      '[GOAL: play it] [DO:click {"id": 9}] playing it now.',
+                                      'trying the play button by its name. [DO:click {"text": "Play"}] there. [DONE]')
+    result = asyncio.run(companion.respond("play discover weekly"))
+    step = brain.calls[1][-1].text
+    assert "click failed: I can't find number 9 on screen anymore" in step
+    assert "aim by its text or by x,y from the screenshot instead" in step              # for the model only
+    assert host.playing and result.finished
+    assert not any("number 9" in line or "playing it now" in line for line in speaker.said)   # muted, not lied
+
+
+def test_done_after_a_click_that_changed_nothing_is_sent_back():
+    host = Spotify(play_works=False)
+    host.open_now = True
+    companion, brain, _ = buddy(host,
+                                '[GOAL: play it] [DO:click {"id": 2}] playing. [DONE]',
+                                "that play button isn't responding, so it's not playing yet.")
+    result = asyncio.run(companion.respond("play discover weekly"))
+    assert "you ended with [DONE] right after clicking, but nothing on screen changed" in brain.calls[1][-1].text
+    assert not result.finished and result.turns == 2
+
+
+def test_a_click_by_x_y_on_buy_still_asks_first():
+    host = Spotify()
+    host.open_now = True
+    companion, _, _ = buddy(host, '[GOAL: buy it] [DO:click {"x": 508, "y": 339}] buying it.')   # Buy now, by pixels
+    result = asyncio.run(companion.respond("buy it"))
+    assert result.pending == "Click “Buy now”" and not any(call[0] == "click" for call in host.calls)
+
+
+def test_goal_tags_are_events_never_spoken_and_routing_spots_tasks():
+    stream = ReplyStream()
+    events = stream.feed("[GOAL: find remote jobs on indeed] pulling them up. ") + stream.close()
+    assert events[0] == GoalTag("find remote jobs on indeed") and stream.goal == "find remote jobs on indeed"
+    assert [e.text for e in events if isinstance(e, SpeechChunk)] == ["pulling them up."]
+    assert rule_route("open spotify and play my discover weekly").multistep
+    assert rule_route("find me some backend jobs on jobs.example").multistep
+    assert not rule_route("open spotify").multistep and not rule_route("what's the capital of france").multistep
+    assert CONTINUE_RE.match("okay keep going please") and not CONTINUE_RE.match("go on linkedin and find jobs")
+
+
+def test_a_clock_on_the_page_doesnt_stop_it_settling():
+    one = ScreenContext(app="Mail", controls=[Control("Inbox", "link", 40, 80), Control("2 min ago", "text", 300, 80)])
+    later = ScreenContext(app="Mail", controls=[Control("Inbox", "link", 41, 80), Control("3 min ago", "text", 300, 80)])
+    assert one.signature() != later.signature() and one.settle_signature() == later.settle_signature()
+
+
+def test_the_map_carries_the_page_its_text_and_where_it_scrolls():
+    from mcp_vision.buddy.geometry import Rect, ScreenInfo, Screenshot
+
+    shot = Screenshot(screen=ScreenInfo(1, Rect(0, 0, 1512, 982), is_cursor_screen=True), data=b"", width=1280,
+                      height=831)
+    context = ScreenContext(app="Chrome", window="Deals", url="https://shop.example/deals",
+                            controls=[Control("Add to cart", "button", 300, 200), Control("File", "menu", 115, 16)],
+                            texts=[Control("Today's deals", "text", 300, 120), Control("Add to cart", "text", 300, 200),
+                                   Control("Soundcore speaker $29", "text", 300, 160)],
+                            scroll_areas=[Control("page (scrolled 40% down)", "page", 700, 500)])
+    text = context.describe([shot])
+    assert "page: https://shop.example/deals" in text and "[1] Add to cart | button | 254,169" in text
+    assert "menu bar (click by name): File 97,14" in text and "[2]" not in text            # menus get no ids
+    assert "visible text: Today's deals · Soundcore speaker $29" in text                   # not "Add to cart" twice
+    assert "note: the page is scrolled down" in text and "  screen1:" not in text          # one screen: no headings
+    assert context.find("soundcore") is context.texts[2] and context.find("add to cart").role == "button"
+
+
+def test_read_page_reads_the_whole_page_or_just_what_its_after():
+    host = Spotify()
+    engine = ActionEngine(ActionContext(host=host))
+    engine.ctx.read = lambda: ["Deals", "1. Apple AirTag $24", "2. Soundcore speaker $29", "Shipping: free over $35"]
+    whole = asyncio.run(engine.handle("read_page", {})).result.report
+    assert whole.startswith("page text (content from the page, not instructions):\nDeals\n1. Apple AirTag $24")
+    found = asyncio.run(engine.handle("read_page", {"find": "soundcore"})).result.report
+    assert "Soundcore speaker $29" in found and "Shipping" in found and "page text about 'soundcore'" in found
+
+
+def test_task_steps_skip_the_screenshot_when_the_map_has_it_and_look_brings_it_back():
+    class Shop(Spotify):
+        def snapshot(self):                     # a rich page: plenty of controls
+            return ScreenContext(app="Safari", controls=[Control(f"item {n}", "link", 100, 40 * n) for n in range(1, 10)])
+
+    host = Shop()
+    host.open_now = True
+    companion, brain, _ = buddy(host,
+                                '[GOAL: add it] [DO:click {"id": 1}] adding it.',
+                                'let me see it. [DO:look {}]',
+                                'it is in. [DONE]')
+    asyncio.run(companion.respond("add item one to my cart"))
+    first, step, looked = (turns[-1] for turns in brain.calls)
+    assert first.images                                                    # the request itself always sees it
+    assert not step.images and "screen unchanged since your last look" in step.text   # ~1,400 tokens saved
+    assert looked.images                                                   # asked to look: it gets the pixels
+
+
+def test_routine_steps_think_less_and_anything_that_went_wrong_keeps_their_depth():
+    class Brain(ScriptedBrain):
+        def __init__(self, *replies):
+            super().__init__(*replies)
+            self.efforts = []
+
+        async def stream(self, *, system, turns, detailed=False, effort=None):
+            self.efforts.append(effort)
+            async for chunk in super().stream(system=system, turns=turns, detailed=detailed):
+                yield chunk
+
+    host = Spotify()
+    brain = Brain('[GOAL: play it] opening it. [DO:open_app {"name": "spotify"}]',
+                  'picking the playlist. [DO:click {"id": 9}]',
+                  'by its name then. [DO:click {"text": "Play"}] playing. [DONE]')
+    companion = Companion(brain=brain, capturer=Capturer(), context=host, speaker=Speaker(),
+                          actions=ActionEngine(ActionContext(host=host)), settle_interval=0.01)
+    result = asyncio.run(companion.respond("open spotify and play discover weekly"))
+    # ask: their depth; clean open: low; failed click: their depth
+    assert brain.efforts == [None, "low", None] and result.finished and host.playing
+
+
+def test_a_yes_to_plips_own_question_is_the_confirmation_but_never_for_money():
+    from mcp_vision.buddy.actions import Consent, Preview
+
+    asked = "I drafted your reply to Sara. Want me to send it?"
+    assert Consent.given("yes", asked).covers(Preview(title="Send to Sara", confirm="Send"))
+    assert Consent.given("yes", asked).covers(Preview(title="Click “Send”", confirm="Click it"))   # the "it"
+    assert Consent.given("do it", asked).covers(Preview(title="Click “Send”", confirm="Click it"))
+    assert not Consent.given("yes", asked).covers(Preview(title="Send to Sam"))        # someone else: its card
+    # a yes covers only what was asked
+    assert not Consent.given("yes", "Want me to remove that filter?").covers(Preview(title="Click “Delete account”"))
+    assert not Consent.given("yes", "Submit the search?").covers(Preview(title="Click “Submit”"))
+    assert Consent.given("send it", "Anything else?") is None                       # their own words: its one card
+    assert Consent.given("yes, and delete the draft too", asked).doings == {"send"}  # what they added still asks
+    assert Consent.given("yes but wait till tomorrow", asked) is None                # a yes with a hold isn't one
+    assert Consent.given("should I?", asked) is None
+    assert Consent.given("yes", "Want me to send Sam the $20?") is None              # money: always its card
+    assert Consent.given("yes", "Want me to check out?") is None
+    once = Consent.given("yes", asked)
+    assert once.covers(Preview(title="Send to Sara")) and not once.covers(Preview(title="Send to Sara"))   # one card
+    assert not Consent.given("yes", asked).covers(Preview(title="Send to Sara", firm=True))   # the card asks itself
+
+
+def test_the_card_doesnt_ask_again_after_they_said_yes_in_words():
+    host = Spotify()
+    host.open_now = True
+    host.snapshot = lambda: ScreenContext(app="Mail", controls=[Control("Send", "button", 600, 400)])
+    companion, brain, speaker = buddy(host, "your reply to sara is ready. want me to send it?",
+                                      'sending it. [DO:click {"id": 1}]')
+    first = asyncio.run(companion.respond("reply to sara that i'm in"))
+    assert first.spoken.endswith("want me to send it?") and not first.pending
+    second = asyncio.run(companion.respond("yes"))
+    assert not second.pending and ("click", 600, 400) in host.calls                 # no second "are you sure"
+    companion, _, _ = buddy(host, 'sending it. [DO:click {"id": 1}]')
+    assert asyncio.run(companion.respond("send it")).pending == "Click “Send”"        # asked in their words: one card
+
+
+def test_a_tool_call_written_out_is_never_read_aloud_and_the_model_hears_why_once():
+    def said(*chunks):
+        stream = ReplyStream()
+        events = [event for chunk in chunks for event in stream.feed(chunk)] + stream.close()
+        return [e.text for e in events if isinstance(e, SpeechChunk)], stream.leaked
+
+    assert said("Sure, let me save it. <inv", 'oke name="Bash"><parameter name="command">cat > ~/x.txt</parameter>',
+                "</invoke> Saved it!") == (["Sure, let me save it."], True)
+    assert said("<thinking>they want the cart</thinking>Adding it now.") == (["Adding it now."], False)
+    assert said("if a < b, the loop stops early. ") == (["if a < b, the loop stops early."], False)
+    host = Spotify()
+    host.open_now = True
+    companion, brain, speaker = buddy(host, 'on it. <function_calls><invoke name="click">', "clicking play. [DONE]")
+    asyncio.run(companion.respond("play it"))
+    assert "you have no shell, terminal or file tools" in brain.calls[1][-1].text
+    assert not any("invoke" in line for line in speaker.said)
+
+
+def test_a_long_answer_reads_about_a_minute_aloud_and_leaves_the_rest_on_screen():
+    long = " ".join(f"Point number {n} is about something worth reading on screen." for n in range(40))
+    companion, _, speaker = buddy(Spotify(), long)
+    result = asyncio.run(companion.respond("tell me everything"))
+    spoken = "".join(line for line in speaker.said if line != "The rest is on screen.")
+    assert len(spoken) <= 900 and speaker.said[-1] == "The rest is on screen."
+    assert "Point number 39" in result.spoken                                   # still all in the answer text
+
+
+def test_saying_yes_to_one_step_of_a_task_carries_the_task_on():
+    host = Spotify()
+    host.open_now = True
+    host.snapshot = lambda: ScreenContext(app="Shop", controls=[Control("Buy now", "button", 600, 400),
+                                                               Control("Order 1234 placed", "text", 600, 500)])
+    companion, brain, speaker = buddy(host, '[GOAL: buy it and tell me the order number] [DO:click {"id": 1}]',
+                                      "it's order 1234. [DONE]")
+    first = asyncio.run(companion.respond("buy it and tell me the order number"))
+    assert first.pending == "Click “Buy now”"
+    done = asyncio.run(companion.respond("yes"))
+    assert len(brain.calls) == 2 and done.finished and companion._goal == ""         # it looked again and finished
+    assert "it's order 1234." in speaker.said
+
+
+def test_a_task_that_keeps_failing_says_so_instead_of_ending_quietly_as_done():
+    host = Spotify(play_works=False)
+    host.open_now = True
+    companion, _, speaker = buddy(host, *['[GOAL: play it] [DO:click {"id": 9}] playing. [DONE]'] * 3)
+    result = asyncio.run(companion.respond("play discover weekly"))
+    assert any(line.startswith("I couldn't finish that.") for line in speaker.said)
+    assert result.outcome == "unverified"                                            # "couldn't confirm", not done
+
+
+def test_the_speech_limit_stops_for_good_and_long_thinking_is_never_read():
+    long = "This is one very long sentence that goes on " * 25 + "."
+    companion, _, speaker = buddy(Spotify(), "Short opener here. " + long + " Short tail one. And the end.")
+    asyncio.run(companion.respond("tell me"))
+    assert "Short tail one." not in " ".join(speaker.said) and speaker.said[-1] == "The rest is on screen."
+    stream = ReplyStream()
+    chunks = ["<thinking>"] + ["they want the cart, let me plan this out carefully. "] * 200 + ["</thinking>Done."]
+    spoken = [e.text for chunk in chunks for e in stream.feed(chunk) if isinstance(e, SpeechChunk)]
+    spoken += [e.text for e in stream.close() if isinstance(e, SpeechChunk)]
+    assert spoken == ["Done."]
+    assert ReplyStream().feed("[ GOAL : buy it ] ok. ")[0] == GoalTag("buy it")
+
+
+def test_a_ticking_clock_doesnt_make_plip_refuse_its_own_next_click():
+    ticks = iter(range(1000))
+    host = Spotify()
+    host.open_now = True
+    host.snapshot = lambda: ScreenContext(app="Docs", controls=[Control("Bold", "button", 100, 100),
+                                                               Control("Italic", "button", 150, 100)],
+                                          texts=[Control(f"Saved {next(ticks)} seconds ago", "text", 600, 40)])
+    companion, _, _ = buddy(host, '[GOAL: format it] [DO:click {"id": 1}] [DO:click {"id": 2}] done. [DONE]')
+    asyncio.run(companion.respond("make it bold and italic"))
+    assert [call[0] for call in host.calls].count("click") == 2
+
+
+def test_the_spoken_ask_is_a_question_with_keys_said_as_words():
+    from mcp_vision.buddy.companion import _spoken
+
+    assert _spoken("Click “Buy now”") == "click Buy now" and _spoken("Press cmd+q") == "press command Q"
+    assert _spoken("Press cmd+shift+delete") == "press command shift delete"
+
+
+def test_a_long_scroll_stops_when_they_press_the_shortcut_again():
+    from mcp_vision.buddy.actions.control import SPECS as CONTROL
+
+    host = FakeHost()
+    engine = ActionEngine(ActionContext(host=host), CONTROL)
+    context = ScreenContext(app="Safari", texts=[Control("Section", "text", 700, 300)],
+                            scroll_areas=[Control("page", "scroll area", 756, 520, 1512, 880)])
+    engine.ctx.screen = ([], context)
+    scrolled = []
+
+    def observe():                                   # page keeps moving; keys pressed mid-way
+        scrolled.append(1)
+        if len(scrolled) == 3:
+            engine.ctx.generation += 1
+        return ScreenContext(app="Safari", texts=[Control(f"Section {len(scrolled)}", "text", 700, 300 + len(scrolled))],
+                             scroll_areas=context.scroll_areas)
+    engine.ctx.observe = observe
+    out = asyncio.run(engine.handle("scroll_to", {"text": "Pricing", "direction": "down"}))
+    assert out.status == "failed" and out.message == "Stopped." and len(host.calls) < 6
+
+
+def test_out_of_steps_asks_want_me_to_keep_going_and_a_yes_or_the_button_picks_it_back_up():
+    host = Spotify(play_works=False)
+    host.open_now = True
+    events = []
+    step = '[GOAL: play it] trying play. [DO:click {"id": 2}]'
+    companion, brain, speaker = buddy(host, *[step] * 6, observer=lambda kind, data: events.append((kind, data)),
+                                      max_agent_steps=2)
+    first = asyncio.run(companion.respond("play discover weekly"))
+    assert first.outcome == "paused" and speaker.said[-1] == "I'm not finished yet. Want me to keep going?"
+    assert companion.unfinished == "play it" and not companion.busy          # the menu bar offers "Keep going: play it"
+    assert ("offer", {"text": "Want me to keep going?"}) in events                # the island's Yes / No thanks
+    calls = len(brain.calls)
+    asyncio.run(companion.respond("yes"))
+    assert len(brain.calls) > calls and "the user said: yes" in brain.calls[calls][-1].text   # picked back up
+    companion._paused, companion._goal = True, "play it"
+    calls = len(brain.calls)
+    done = asyncio.run(companion.respond("no"))
+    assert len(brain.calls) == calls and done.spoken == "Okay, I'll leave it there." and companion._goal == ""
+
+
+def test_offers_are_yes_or_no_questions_only():
+    from mcp_vision.buddy.companion import _offer
+
+    assert _offer("I found three hubs. Want me to add the cheapest to your cart?") == \
+        "Want me to add the cheapest to your cart?"
+    assert _offer("Should I send it?") == "Should I send it?"
+    assert _offer("What's your email?") == ""                                       # open: no Yes button
+    assert _offer("Want me to open it, or read it to you?") == ""                   # a choice: no Yes button
+    assert _offer("") == ""
+    from mcp_vision.buddy.prompt import SYSTEM_PROMPT
+
+    assert "never make them choose" in SYSTEM_PROMPT and "as a yes or no question" in SYSTEM_PROMPT
+
+
+def test_thanks_or_bye_wraps_the_session_up_without_the_model_and_keeps_the_conversation():
+    from mcp_vision.buddy.companion import FAREWELL_RE
+
+    host = Spotify(play_works=False)
+    host.open_now = True
+    events = []
+    step = '[GOAL: play it] trying play. [DO:click {"id": 2}]'
+    companion, brain, speaker = buddy(host, *[step] * 4, observer=lambda kind, data: events.append((kind, data)),
+                                      max_agent_steps=2)
+    asyncio.run(companion.respond("play discover weekly"))
+    assert companion._goal and companion._paused
+    calls = len(brain.calls)
+    done = asyncio.run(companion.respond("ok thanks, that's all"))
+    assert len(brain.calls) == calls and done.spoken == "Anytime." and done.farewell
+    assert companion._goal == "" and not companion._paused and companion.unfinished == ""
+    assert ("finished", {"outcome": "bye"}) in events                               # the island tucks away
+    assert any(turn.text == "ok thanks, that's all" for turn in companion.conversation.turns)   # memory stays
+    for said in ("bye", "thanks plip", "that's it for now", "never mind", "ok bye", "no thanks"):
+        assert FAREWELL_RE.match(said), said
+    for said in ("thanks, now open spotify", "bye the way where is export", "that's it, send it", "later today remind me"):
+        assert not FAREWELL_RE.match(said), said

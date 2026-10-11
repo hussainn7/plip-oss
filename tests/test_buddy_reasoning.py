@@ -110,7 +110,8 @@ def test_observer_sees_the_whole_turn():
     assert "engine" in kinds and events.kinds("engine")[0] == {"label": "Claude", "kind": "subscription", "model": None}
     assert {s["id"] for s in events.kinds("step")} >= {"look", "think"}
     assert "".join(d["text"] for d in events.kinds("answer")) == "Sure. Open settings."
-    assert kinds.index("answer") < kinds.index("done")
+    assert kinds.index("answer") < kinds.index("done") < kinds.index("quiet")    # the island waits for the voice
+    assert kinds[-2:] == ["quiet", "finished"]
 
 
 def test_screen_map_uses_screenshot_pixels_and_text_only_brains_get_no_images():
@@ -121,9 +122,9 @@ def test_screen_map_uses_screenshot_pixels_and_text_only_brains_get_no_images():
                                       Control("File", "menu", 189, 12)])
     text = context.describe([shot])
     assert 'frontmost app: Keynote (window "Q4.key")' in text and 'selected text: "hello world"' in text
-    assert "File | menu | 160,10" in text and "Off screen" not in text and text.count("File |") == 1
+    assert "menu bar (click by name): File 160,10" in text and "Off screen" not in text and text.count("File") == 1
     turn = user_turn_text("where is file", [shot], context)
-    assert turn.endswith("the user said: where is file") and "controls on screen" in turn
+    assert turn.endswith("the user said: where is file") and "menu bar (click by name)" in turn
     assert "(image dimensions" in user_turn_text("q", [shot], context, vision=False)
     assert "can't see the screenshot" in system_prompt(vision=False)
 
@@ -135,7 +136,7 @@ def test_screen_map_uses_screenshot_pixels_and_text_only_brains_get_no_images():
 
     asyncio.run(Companion(brain=brain, capturer=capturer(), context=FixedContext()).respond("where is file"))
     system, turns = brain.seen[0]
-    assert turns[-1].images == () and "File | menu" in turns[-1].text and "can't see" in system
+    assert turns[-1].images == () and "File 160,10" in turns[-1].text and "can't see" in system
 
 
 def test_watcher_needs_a_change_that_then_settles():
@@ -160,3 +161,181 @@ def test_watcher_needs_a_change_that_then_settles():
 
 def test_capturer_fingerprint_is_small():
     assert len(capturer().fingerprint()) == 64 * 40
+
+
+class FakeAX:
+    """Minimal ApplicationServices: elements are dicts with a frame."""
+
+    kAXValueCGPointType, kAXValueCGSizeType = "point", "size"
+
+    def AXUIElementCopyAttributeValue(self, element, attribute, _):
+        if attribute in {"AXPosition", "AXSize"} and "frame" in element:
+            return 0, (attribute, element["frame"])
+        return (0, element[attribute]) if attribute in element else (-25212, None)
+
+    def AXValueGetValue(self, value, kind, _):
+        from types import SimpleNamespace
+
+        x, y, width, height = value[1]
+        return True, SimpleNamespace(x=x, y=y) if kind == "point" else SimpleNamespace(width=width, height=height)
+
+
+def ax(role, frame=None, title="", children=()):
+    node = {"AXRole": role, "AXChildren": list(children)}
+    if frame is not None:
+        node["frame"] = frame
+    if title:
+        node["AXTitle"] = title
+    return node
+
+
+def test_the_screen_map_only_lists_what_is_actually_on_screen():
+    from mcp_vision.buddy.ax_context import MacAXContext
+
+    # real AX quirks: toolbar above the screen, tabs listed twice, 1x1 skip link,
+    # scrolled-off links as top-edge slivers, an inner list hiding its rows
+    tab = ax("AXRadioButton", (380, -60, 60, 30), "Recordings tab")
+    toolbar = ax("AXToolbar", (0, -100, 1512, 63), children=[ax("AXButton", (20, -90, 30, 30), "Back"), tab, tab])
+    inner = ax("AXScrollArea", (800, 400, 300, 200), children=[
+        ax("AXList", (800, 100, 300, 800), children=[ax("AXButton", (820, 150, 80, 30), "Row above"),
+                                                    ax("AXButton", (820, 450, 80, 30), "Row shown")])])
+    page = ax("AXWebArea", (0, 37, 1512, 945), children=[
+        ax("AXLink", (0, 37, 1, 1), "Skip to content"),
+        ax("AXLink", (250, 37, 60, 1.5), "1 Branch"),
+        ax("AXButton", (500, 20, 100, 40), "Half scrolled"),
+        ax("AXButton", (1300, 120, 100, 30), "Invite"),
+        inner])
+    window = ax("AXWindow", (0, 37, 1512, 945), "PostHog", children=[toolbar, ax("AXScrollArea", (0, 37, 1512, 945),
+                                                                                  children=[page])])
+    menubar = ax("AXMenuBar", (0, 0, 1512, 37), children=[ax("AXMenuBarItem", (60, 4, 40, 28), "File")])
+
+    controls = MacAXContext()._walk(FakeAX(), [menubar, window])
+
+    assert [c.label for c in controls] == ["File", "Half scrolled", "Invite", "Row shown"]
+    half = next(c for c in controls if c.label == "Half scrolled")
+    assert (half.x, half.y) == (550, 48.5)          # middle of the on-screen part
+
+
+def test_the_screen_map_says_where_typing_goes_but_never_what_is_typed():
+    from mcp_vision.buddy.ax_context import _focused
+
+    search = {"AXRole": "AXTextField", "AXDescription": "Address and search bar", "AXValue": "secret query"}
+    password = {"AXRole": "AXTextField", "AXSubrole": "AXSecureTextField", "AXTitle": "Password", "AXValue": "hunter2"}
+    assert _focused(FakeAX(), search) == 'text field "Address and search bar"'
+    assert _focused(FakeAX(), password) == 'password field "Password"'
+    assert _focused(FakeAX(), {"AXRole": "AXButton", "AXTitle": "OK"}) == ""
+    screen = ScreenInfo(1, Rect(0, 0, 1512, 982), is_cursor_screen=True)
+    text = ScreenContext(app="Chrome", focused=_focused(FakeAX(), search)).describe(
+        [Screenshot(screen=screen, data=b"jpg", width=1280, height=831)])
+    assert 'typing goes into: text field "Address and search bar"' in text and "secret" not in text
+
+
+def test_a_walkthrough_is_routed_once_and_keeps_its_effort_and_screen_every_step():
+    from mcp_vision.buddy.companion import Route
+    from mcp_vision.buddy.router import rule_route
+
+    class Router:
+        """User's question routes deep; Plip's check-ins would route quick."""
+
+        def __init__(self):
+            self.heard = []
+
+        async def route(self, transcript, screens):
+            self.heard.append(transcript)
+            return Route(needs_screen=True, detailed=len(self.heard) == 1, provider="jev", latency_ms=120)
+
+    class Brain(ScriptedBrain):
+        async def stream(self, *, system, turns, detailed=False):
+            self.depths = [*getattr(self, "depths", []), detailed]
+            async for chunk in super().stream(system=system, turns=turns, detailed=detailed):
+                yield chunk
+
+    brain = Brain([["[STEPS:3] First, open the File menu. [POINT:20,10:File menu]"],
+                   ["Nice. Now pick Export. [POINT:60,80:Export]"], ["Perfect, that's exported. [DONE]"]])
+    router = Router()
+    result = asyncio.run(Companion(brain=brain, capturer=capturer(), router=router,
+                                   watcher=ScriptedWatcher([True, True])).respond("walk me through exporting a pdf"))
+    assert result.finished and result.turns == 3
+    assert router.heard == ["walk me through exporting a pdf"]      # check-ins aren't re-routed
+    assert brain.depths == [True, True, True]                       # one effort for the whole task
+    assert all(turns[-1].images for _, turns in brain.seen)          # every check-in sees the screen
+
+
+def test_check_ins_follow_the_checklist_the_user_sees():
+    brain = ScriptedBrain([
+        ["[STEPS:3] [PLAN: open file menu | pick export | save pdf] First, open the File menu. [POINT:20,10:File]"],
+        ["Nice. Now pick Export. [POINT:60,80:Export]"],
+        ["Last one, hit Save. [POINT:90,90:Save]"],
+        ["Done, it's saved. [DONE]"],
+    ])
+    result = asyncio.run(Companion(brain=brain, capturer=capturer(),
+                                   watcher=ScriptedWatcher([True, True, True])).respond("export as pdf"))
+    assert result.finished and result.plan == ("open file menu", "pick export", "save pdf")
+    first, second, third = (turns[-1].text for _, turns in brain.seen[1:])
+    # says the screen changed (not that it's right) and names the next step
+    assert 'my screen changed after step 1 of 3 ("open file menu")' in first and 'next step ("pick export")' in first
+    assert '("pick export")' in second and 'next step ("save pdf")' in second
+    assert 'step 3 of 3 ("save pdf")' in third and "next step," in third
+    history = brain.seen[1][1][-2].text                     # step one's reply, as read back
+    assert history.startswith("[STEPS:3] [PLAN: open file menu | pick export | save pdf] First, open the File menu.")
+
+
+def test_a_point_on_a_listed_control_lands_on_it_without_waiting_for_a_snap():
+    class Snapper:
+        def __init__(self):
+            self.asked = []
+
+        async def snap(self, target):
+            self.asked.append(target.label)
+            return target
+
+    context = ScreenContext(app="Chrome", controls=[Control("Invite", "button", 1350.0, 86.0)])
+
+    class FixedContext:
+        def snapshot(self):
+            return context
+
+    # Invite is mapped at 1143,73 (1280 px shot); the other point still snaps
+    brain = ScriptedBrain([["Invite them up here. [POINT:1143,73:Invite] Or the help icon. [POINT:40,700:help]"]])
+    snapper, events = Snapper(), Events()
+    result = asyncio.run(Companion(brain=brain, capturer=capturer(), context=FixedContext(), snapper=snapper,
+                                   observer=events).respond("where do i invite people"))
+    invite, help_icon = result.targets
+    assert (invite.x, invite.y, invite.source) == (1350.0, 86.0, "snapped")   # the control's exact center
+    assert snapper.asked == ["help"]                                            # no ~190 ms snap for the listed one
+    assert [point["snapped"] for point in events.kinds("point")] == [True, False]
+
+
+def test_the_map_shows_whats_typed_in_boxes_by_their_label_and_never_a_secret():
+    from mcp_vision.buddy.ax_context import MacAXContext
+
+    def box(frame, value, **attrs):
+        node = ax("AXTextField", frame, **({"title": attrs.pop("title")} if "title" in attrs else {}))
+        node.update({"AXValue": value, **attrs})
+        return node
+
+    window = ax("AXWindow", (0, 37, 1512, 945), "Checkout", children=[
+        box((100, 100, 300, 28), "usb-c hub", AXPlaceholderValue="Search products"),
+        box((100, 150, 300, 28), "4111 1111 1111 1111", title="Card number"),
+        box((100, 200, 300, 28), "hunter2", title="Password", AXSubrole="AXSecureTextField"),
+        box((100, 250, 300, 28), "Austin")])                              # no label at all: still gets an id
+    controls = MacAXContext()._walk(FakeAX(), [window])
+    assert [(c.label, c.value) for c in controls] == [("Search products", "usb-c hub"), ("Card number", ""),
+                                                      ("Password", ""), ("text field", "Austin")]
+    screen = ScreenInfo(1, Rect(0, 0, 1512, 982), is_cursor_screen=True)
+    text = ScreenContext(app="Chrome", controls=controls).describe(
+        [Screenshot(screen=screen, data=b"jpg", width=1280, height=831)])
+    assert '[1] Search products = "usb-c hub" | text field' in text and "4111" not in text and "hunter2" not in text
+    assert ScreenContext(controls=controls).find("search products").value == "usb-c hub"    # found by its label
+
+
+def test_text_plip_just_typed_isnt_the_page_changing():
+    from mcp_vision.buddy.companion import TurnResult
+
+    before = ScreenContext(app="Safari", controls=[Control("Search", "text field", 600, 60)])
+    after = ScreenContext(app="Safari", controls=[Control("Search", "text field", 600, 60, value="usb-c hub")])
+    companion = Companion(brain=ScriptedBrain([]), capturer=capturer())
+    companion._settled = after
+    typed = TurnResult(transcript="", typed=["usb-c hub"])
+    assert companion._unchanged(after.signature(), before, typed)               # typing, then a dead return
+    assert not companion._unchanged(after.signature(), before, TurnResult(transcript=""))   # someone else's change

@@ -1,0 +1,242 @@
+"""Typing lands once: late fields (Chrome, Electron), no paste on top, read back after."""
+from __future__ import annotations
+
+import asyncio
+import time
+
+from buddy_fakes import FakeHost, shot
+from mcp_vision.buddy.actions import ActionContext, ActionEngine
+from mcp_vision.buddy.geometry import Rect
+from mcp_vision.buddy.screen_context import Control, ScreenContext
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def page():
+    return ScreenContext(app="Safari", window="Acme", controls=[
+        Control("Back", "button", 40, 60), Control("Search", "text field", 600, 60),
+        Control("Place order", "button", 1300, 900)])
+
+
+def hands(context=None, host=None):
+    host = host or FakeHost()
+    shots = [shot()]
+    context = context or page()
+    context.describe(shots)
+    return ActionEngine(ActionContext(host=host, screen=(shots, context))), host
+
+
+class Box:
+    """A text field: real value, select-all state, what Accessibility reads (late)."""
+
+    def __init__(self, value="", frame=Rect(450, 46, 300, 28)):           # page()'s Search field
+        self.value, self.frame, self.selected = value, frame, False
+        self.seen = [(0.0, value)]                 # (when AX catches up, what it reads)
+
+    def put(self, text, lag):
+        self.value = text if self.selected else self.value + text
+        self.selected = False                      # typing replaces a select-all; caret at end
+        self.seen.append((time.monotonic() + lag, self.value))
+
+    def read(self):
+        now = time.monotonic()
+        return [value for at, value in self.seen if at <= now][-1]
+
+
+class Fields(FakeHost):
+    """Text fields that answer late, like real apps.
+
+    lag/focus_lag: AX shows typing/focus moves that late; deaf: ignores keys; paste_works=False: paste fails too;
+    hidden: editor typing via a stand-in box (Docs, VS Code); secure: names of password boxes.
+    """
+
+    def __init__(self, value="old search", *, deaf=False, paste_works=True, lag=0.0, focus_lag=0.0, hidden=False,
+                 boxes=None, secure=()):
+        super().__init__()
+        self.boxes = boxes or {"search": Box(value)}
+        self.focus = next(iter(self.boxes))        # where keys land
+        self.followed = (0.0, self.focus, self.focus)   # (when AX focus moves, to, from)
+        self.deaf, self.paste_works, self.lag, self.focus_lag, self.hidden = deaf, paste_works, lag, focus_lag, hidden
+        self.secure = set(secure)
+
+    @property
+    def value(self):
+        return next(iter(self.boxes.values())).value
+
+    def _ax(self):
+        at, now, was = self.followed
+        return self.boxes[now if time.monotonic() >= at else was]
+
+    def focused_value(self):
+        return "" if self.hidden else self._ax().read()
+
+    def focused_frame(self):
+        frame = self._ax().frame
+        return Rect(frame.x + 8, frame.y + 6, 1, 16) if self.hidden else frame
+
+    def focused_secure(self):
+        return any(box is self._ax() for name, box in self.boxes.items() if name in self.secure)
+
+    def click(self, x, y, button="left", count=1):
+        super().click(x, y, button, count)
+        hit = next((name for name, box in self.boxes.items() if box.frame.contains(x, y)), None)
+        if hit is not None:
+            was = next(name for name, box in self.boxes.items() if box is self._ax())
+            self.focus, self.followed = hit, (time.monotonic() + self.focus_lag, hit, was)
+            self.boxes[hit].selected = False
+
+    def press(self, keys):
+        super().press(keys)
+        if keys == "cmd+a":
+            self.boxes[self.focus].selected = True
+
+    def type_text(self, text):
+        super().type_text(text)
+        if not self.deaf:
+            self.boxes[self.focus].put(text, self.lag)
+
+    def paste(self, text):
+        self.calls.append(("paste", text))
+        if self.paste_works:
+            self.boxes[self.focus].put(text, self.lag)
+
+
+def kinds(host):
+    return [call[0] for call in host.calls]
+
+
+def test_typing_into_a_named_field_replaces_it_and_append_keeps_it():
+    host = Fields()
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "usb-c hub", "id": 2}))
+    assert host.value == "usb-c hub" and out.result.report == "typed into 'Search'; the field now reads 'usb-c hub'"
+    host = Fields(lag=0.06)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": " and more", "id": 2, "append": True}))
+    assert host.value == "old search and more" and kinds(host) == ["click", "type"]
+    assert out.result.report.endswith("reads 'old search and more'")
+
+
+def test_a_field_that_shows_typing_late_gets_it_once_not_typed_and_pasted():
+    for lag in (0.06, 0.3):                      # Chrome shows keys late; one read would paste on top
+        host = Fields("", lag=lag)
+        e, _ = hands(host=host)
+        out = run(e.handle("type_text", {"text": "active", "id": 2, "submit": True}))
+        assert out.status == "done" and host.value == "active", lag
+        assert kinds(host) == ["click", "press", "type", "press"] and host.calls[-1] == ("press", "return")
+
+
+def test_retyping_what_a_field_already_reads_leaves_it_alone_and_a_doubled_one_gets_fixed():
+    host = Fields("active")
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "active", "id": 2}))
+    assert host.value == "active" and kinds(host) == ["click"]
+    assert "already reads 'active'" in out.result.report and out.result.detail == "Already there"
+    host = Fields("activeactive", lag=0.15)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "active", "id": 2}))
+    assert out.status == "done" and host.value == "active" and "paste" not in kinds(host)
+
+
+def test_keys_that_land_after_the_wait_get_replaced_by_the_paste_not_doubled(monkeypatch):
+    from mcp_vision.buddy.actions import core
+
+    monkeypatch.setattr(core, "VERIFY", 0.1)
+    host = Fields("", lag=0.15)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "active", "id": 2}))
+    assert out.status == "done" and host.value == "active"
+    assert kinds(host) == ["click", "press", "type", "press", "paste"]          # select all again, then paste
+
+
+def test_typing_that_doesnt_land_is_pasted_instead_and_reported_if_that_fails_too(monkeypatch):
+    from mcp_vision.buddy.actions import core
+
+    monkeypatch.setattr(core, "VERIFY", 0.1)
+    host = Fields(deaf=True)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "hello", "id": 2}))
+    assert out.status == "done" and host.value == "hello" and host.calls[-2:] == [("press", "cmd+a"), ("paste", "hello")]
+    host = Fields(deaf=True, paste_works=False)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "hello", "id": 2}))
+    assert out.status == "failed" and "didn't show up" in out.message
+
+
+def test_hidden_editor_inputs_are_never_pasted_into_or_select_alled():
+    host = Fields("", hidden=True)                # Docs, VS Code, math boxes: value never changes
+    e, _ = hands(host=host)
+    started = time.monotonic()
+    out = run(e.handle("type_text", {"text": "x^2 + 1"}))
+    assert out.status == "done" and host.value == "x^2 + 1" and kinds(host) == ["type"]
+    assert "can't be read back: look before typing it again" in out.result.note
+    assert time.monotonic() - started < 0.5                        # no waiting on a value that never shows
+    out = run(e.handle("type_text", {"text": "y", "id": 2}))
+    assert ("press", "cmd+a") not in host.calls and "at its cursor" in out.result.report     # not the whole doc
+
+
+def test_the_second_field_in_one_reply_isnt_doubled_while_focus_catches_up():
+    first, last = Box("Hussain", Rect(450, 186, 300, 28)), Box("", Rect(450, 246, 300, 28))
+    host = Fields(boxes={"first": first, "last": last}, focus_lag=0.15)   # focus still on the field just typed
+    form = ScreenContext(app="Google Chrome", window="Apply", controls=[
+        Control("First name", "text field", 600, 200), Control("Last name", "text field", 600, 260)])
+    e, _ = hands(form, host=host)
+    out = run(e.handle("type_text", {"text": "Syed", "id": 2}))
+    assert out.status == "done" and last.value == "Syed" and first.value == "Hussain" and "paste" not in kinds(host)
+
+
+def test_the_same_thing_at_the_cursor_twice_in_one_request_types_once_but_never_reads_back_a_password():
+    host = Fields("Dear Sam, ")
+    e, _ = hands(host=host)
+    run(e.handle("type_text", {"text": "thanks for the update"}))
+    out = run(e.handle("type_text", {"text": "thanks for the update"}))
+    assert host.value == "Dear Sam, thanks for the update" and kinds(host) == ["type"]
+    assert "already at the end of the field" in out.result.note
+    host = Fields("", secure={"search"})
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "hunter22", "id": 2}))
+    assert out.status == "done" and "hunter22" not in out.result.report and out.result.report == "typed into 'Search'"
+
+
+def test_a_field_showing_something_else_is_never_read_back_or_submitted(monkeypatch):
+    from mcp_vision.buddy.actions import core
+
+    monkeypatch.setattr(core, "VERIFY", 0.1)
+
+    class LatePaste(Fields):
+        """Keys don't land; the paste drops in their clipboard (a copied password)."""
+
+        def paste(self, text):
+            self.calls.append(("paste", text))
+            self.boxes[self.focus].put("hunter2", 0.0)
+
+    host = LatePaste("", deaf=True)
+    e, _ = hands(host=host)
+    out = run(e.handle("type_text", {"text": "on my way", "id": 2, "submit": False}))
+    assert "doesn't show it as typed" in out.result.report and "hunter2" not in out.result.report
+    assert ("press", "return") not in host.calls
+
+
+def test_more_kinds_of_secret_boxes_never_show_their_contents():
+    from mcp_vision.buddy.screen_context import looks_secret
+
+    for label in ("Seed phrase", "Recovery words", "Private key", "Access key", "6-digit code", "Login code",
+                  "Bank account", "Security answer", "1234 1234 1234 1234", "Password", "CVC"):
+        assert looks_secret(label), label
+    for label in ("Search", "City", "Message", "Order notes", "Promo code", "Subject"):
+        assert not looks_secret(label), label
+
+
+def test_the_action_log_keeps_what_kind_of_thing_happened_never_what_it_was_about(tmp_path):
+    import json
+
+    from mcp_vision.buddy.actions import ActionLog
+
+    log = ActionLog(tmp_path / "actions.jsonl")
+    log.add("remember", {"fact": "my passport is X123", "key": "note", "value": "X123"}, True)
+    log.add("open_url", {"url": "https://mail.example.com/search?q=sam%40example.com"}, True)
+    log.add("search_files", {"query": "divorce papers", "kind": "pdf"}, True)
+    rows = [json.loads(line) for line in (tmp_path / "actions.jsonl").read_text().splitlines()]
+    assert [row["args"] for row in rows] == [{}, {"url": "mail.example.com"}, {"kind": "pdf"}]

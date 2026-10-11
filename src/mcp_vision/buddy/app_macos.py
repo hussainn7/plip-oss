@@ -43,6 +43,11 @@ def _menu_target_class():
                 if action:
                     action()
 
+            def menuWillOpen_(self, _menu):              # NSMenuDelegate: refresh Stop / Keep going
+                action = self.actions.get("will_open")
+                if action:
+                    action()
+
         _CLASSES["target"] = PlipMenuTarget
     return _CLASSES["target"]
 
@@ -92,7 +97,12 @@ class StatusMenu:
         menu.setAutoenablesItems_(False)
         self.status = self._add(menu, "Starting...", None)
         self.status.setEnabled_(False)
-        self._add(menu, "Hold ⌃⌥ and ask anything", None).setEnabled_(False)
+        self.hint = self._add(menu, "Hold ⌃⌥ and ask anything", None)
+        self.hint.setEnabled_(False)
+        self.stop_item = self._add(menu, "Stop", "stop", ".")
+        self.stop_item.setHidden_(True)
+        self.resume_item = self._add(menu, "Keep going", "resume")
+        self.resume_item.setHidden_(True)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
         self._add(menu, "Open Plip...", "settings", ",")
         self.update_item = self._add(menu, "Download the new Plip...", "update")
@@ -103,6 +113,7 @@ class StatusMenu:
         self._add(menu, "Report a bug...", "report")
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
         self._add(menu, "Quit Plip", "quit", "q")
+        menu.setDelegate_(self.target)
         self.item.setMenu_(menu)
 
     def _add(self, menu, title: str, key: str | None, shortcut: str = ""):
@@ -118,6 +129,20 @@ class StatusMenu:
 
     def set_status(self, text: str) -> None:
         self.status.setTitle_(text[:80])
+
+    def set_shortcut(self, chord) -> None:
+        """The talk shortcut picked in Settings (hotkey.Chord)."""
+        self.hint.setTitle_(f"Hold {chord.symbols} and ask anything")
+        button = self.item.button()
+        if button is not None:
+            button.setToolTip_(f"Plip - hold {chord.label} and ask")
+
+    def set_activity(self, busy: bool, unfinished: str) -> None:
+        """Stop while busy; Keep going for an unfinished task."""
+        self.stop_item.setHidden_(not busy)
+        if unfinished:
+            self.resume_item.setTitle_(f"Keep going: {unfinished}"[:60])
+        self.resume_item.setHidden_(busy or not unfinished)
 
     def set_brain(self, text: str) -> None:
         self.brain_item.setTitle_(f"Brain: {text}"[:60])
@@ -172,6 +197,12 @@ def _copy(text: str) -> None:
     board = AppKit.NSPasteboard.generalPasteboard()
     board.clearContents()
     board.setString_forType_(text, AppKit.NSPasteboardTypeString)
+
+
+def _clipboard() -> str:
+    import AppKit
+
+    return str(AppKit.NSPasteboard.generalPasteboard().stringForType_(AppKit.NSPasteboardTypeString) or "")
 
 
 def applescript_string(text: str) -> str:
@@ -275,11 +306,12 @@ def run_buddy_app() -> None:
     from mcp_vision.buddy.actions import ActionLog
     from mcp_vision.buddy.engines import EngineRegistry
     from mcp_vision.buddy.factory import SetupError, apply_prefs, make_companion
-    from mcp_vision.buddy.hotkey import ChordDetector, MacHotkeyListener
+    from mcp_vision.buddy.hotkey import ChordDetector, MacHotkeyListener, chord, keyboard_owner
     from mcp_vision.buddy.overlay_macos import BuddyOverlay, MainThreadPointer
     from mcp_vision.buddy.presenter import Presenter
     from mcp_vision.buddy.settings import load_settings
     from mcp_vision.buddy.settings_service import Platform, SettingsService
+    from mcp_vision.buddy.sounds import Sounds
     from mcp_vision.buddy.speech_in import ListenerCallbacks, make_listener
     from mcp_vision.buddy.usage import UsageLog
     from mcp_vision.buddy.store import History, Prefs
@@ -305,11 +337,11 @@ def run_buddy_app() -> None:
     usage_log = UsageLog()                # the Usage tab: one row per request
     from mcp_vision.buddy.account import Account
 
-    # Sign in once with Google before Plip works (only in builds with a sign-in project).
+    # Accounts (only in builds with a Supabase project): a guest after the walkthrough, Google when they're
+    # ready. Never between the person and the hotkey.
     account = Account(state["settings"].supabase_url, state["settings"].supabase_key, open_url=_open_url,
                       on_change=lambda: AppHelper.callAfter(account_changed),
                       on_signed_in=lambda: AppHelper.callAfter(signed_in))
-    state["signed_in"] = not account.required
 
     def main(fn):
         return lambda *args: AppHelper.callAfter(fn, *args)
@@ -327,10 +359,18 @@ def run_buddy_app() -> None:
         log.warning("WebKit bridge unavailable; using the native cursor overlay (pip install pyobjc-framework-WebKit)")
         mascot = BuddyOverlay(visible=prefs.buddy)
 
+    sounds = Sounds(enabled=lambda: Prefs.load().sounds)
+
+    def touring() -> None:
+        """Live-update the welcome tour's "try it" step while the tour is open."""
+        if state["settings_window"] is not None and not Prefs.load().onboarded:
+            service.push()
+
     presenter = Presenter(
         post_island=(lambda messages: AppHelper.callAfter(island.post, messages)) if island else (lambda _m: None),
         set_mood=(lambda mood, level: AppHelper.callAfter(mascot.set_mood, mood, level))
-        if hasattr(mascot, "set_mood") else None)
+        if hasattr(mascot, "set_mood") else None,
+        on_live=lambda: AppHelper.callAfter(touring), sound=sounds.play)
 
     def settings_window():
         if state["settings_window"] is None:
@@ -356,6 +396,7 @@ def run_buddy_app() -> None:
     def guide_done(permission: str, granted: bool) -> None:
         if granted and permission == "screen":
             state["restart_for_screen"] = True         # macOS applies it to the next launch
+        update_setup_error()                           # Accessibility on: the shortcut starts working
         service.push()
         if granted and state["settings_window"] is not None:
             state["settings_window"].front()           # back to Plip, where you left off
@@ -380,7 +421,22 @@ def run_buddy_app() -> None:
 
     def show_update(found) -> None:
         menu.set_update(found["version"] if found else None)
-        service.push()
+        if found:
+            service.update_found()                     # the one update moment to ask for Google (it pushes)
+        else:
+            service.push()
+
+    def ask_for_google(moment: str, tries: int = 0) -> None:
+        """The service found a moment to ask (service.on_ask). Never over a question in progress, and never
+        a window in their face right after the first answer: a notch line then, Settings from the third on."""
+        if controller.state != "idle" or presenter.phase != "idle":
+            if tries < 30:
+                AppHelper.callLater(20.0, lambda: ask_for_google(moment, tries + 1))
+            return
+        if moment == "first_task":
+            presenter("notice", {"text": "Nice one. Want to keep this Plip as yours? Settings → Account, when you like."})
+        else:
+            open_settings("home")
 
     def tell_update(release, tries: int = 0) -> None:
         if controller.state != "idle" or presenter.phase != "idle":     # never over a question in progress
@@ -402,18 +458,14 @@ def run_buddy_app() -> None:
             time.sleep(6 * 60 * 60)
             ping("app")                               # Plip stays open for days: still one anonymous ping a day
 
-    # -- the account: Plip starts working once they're signed in, and stops if they sign out ------------
+    # -- the account: Settings follows it; the hotkey never waits for it -----------------------------
     def account_changed() -> None:
-        signed = not account.required
-        if signed != state["signed_in"]:
-            state["signed_in"] = signed
-            update_setup_error()                       # ⌃⌥ follows: "I need a little setup first" while signed out
         service.push()
 
     def signed_in() -> None:
-        account_changed()
+        service.signed_in()                            # the funnel's last event, then Settings shows who
         if state["settings_window"] is not None:
-            state["settings_window"].front()           # back from the browser, on to the walkthrough
+            state["settings_window"].front()           # back from the browser
 
     def restart() -> None:
         if not _relaunch():
@@ -429,12 +481,18 @@ def run_buddy_app() -> None:
         call_later=lambda delay, fn: AppHelper.callLater(delay, fn),
         on_main=lambda fn, *args: AppHelper.callAfter(fn, *args),
         on_result=lambda transcript, result: record(transcript, result),
-        on_setup_needed=lambda _message: None if state["building"] else open_settings(
-            "home" if account.required else "brain"),
+        on_setup_needed=lambda _message: None if state["building"] else setup_needed(),
         setup_error="Plip is still waking up. Try again in a second.",
+        press_delay=BuddyController.PRESS_DELAY,
+        sound=sounds.play,
     )
 
+    def setup_needed() -> None:
+        open_settings("brain")
+
     def record(transcript: str, result) -> None:
+        if result.state == "done":
+            AppHelper.callAfter(service.task_done)     # the 1st and 3rd finished task: a moment to ask for Google
         if result.state == "done" and result.spoken:
             badge = getattr(controller.companion, "brain", None)
             history.add(transcript, result.spoken, engine=getattr(badge, "label", ""))
@@ -442,13 +500,37 @@ def run_buddy_app() -> None:
             AppHelper.callAfter(service.push)     # an open History / Usage tab shows it right away
 
     def update_setup_error() -> None:
-        controller.setup_error = account.blocker or state["brain_error"] or state["listener_error"]
+        controller.setup_error = state["brain_error"] or state["listener_error"]
         if controller.setup_error:
             menu.set_status("Needs setup: " + controller.setup_error)
-        elif controller.hotkey_mode == "none":
-            menu.set_status("Grant Accessibility so ⌃⌥ works")
+        elif hotkey_mode() == "none":
+            menu.set_status(f"Allow Accessibility for {keyboard_owner()} so {controller.shortcut_keys} works")
         else:
-            menu.set_status("Ready - hold ⌃⌥ and ask")
+            menu.set_status(f"Ready - hold {controller.shortcut_keys} and ask")
+        post_shortcut()
+
+    def post_shortcut() -> None:
+        """Send the island the shortcut, and whether macOS passes it to Plip."""
+        if island is not None:
+            card = chord(Prefs.load().hotkey).card()
+            island.post([{"type": "shortcut", "state": {**card, "works": hotkey_mode() != "none"}}])
+
+    def hotkey_mode() -> str:
+        """Asked fresh, so Accessibility granted after launch counts."""
+        hotkeys = state.get("hotkeys")
+        controller.hotkey_mode = hotkeys.mode() if hotkeys is not None else "none"
+        return controller.hotkey_mode
+
+    def apply_hotkey(name: str | None = None) -> None:
+        """Listen for the Settings shortcut and show it everywhere."""
+        picked = chord(name if name is not None else Prefs.load().hotkey)
+        detector.set_chord(picked.mask)
+        controller.shortcut, controller.shortcut_keys = picked.label.replace(" + ", "+"), picked.symbols
+        menu.set_shortcut(picked)
+        if controller.companion is not None:          # still waking up: don't say ready yet
+            update_setup_error()
+        else:
+            post_shortcut()
 
     def build(probe: bool) -> None:
         """Worker thread: probe engines (spawns CLIs) and assemble a companion."""
@@ -523,6 +605,7 @@ def run_buddy_app() -> None:
                 AppHelper.callAfter(menu.set_status, "Brain problem: check its key or sign-in in Plip's settings")
         if hasattr(companion.brain, "prewarm"):
             companion.brain.prewarm = True          # the app lives on: keep the next brain process ready
+            loop.call_soon_threadsafe(companion.warm_brain)
         asyncio.run_coroutine_threadsafe(companion.brain.warm(), loop).add_done_callback(warmed)
 
     def rebuild(probe: bool = False) -> None:
@@ -532,8 +615,19 @@ def run_buddy_app() -> None:
     def refresh_engines() -> None:
         def work():
             registry.statuses(refresh=True)
-            AppHelper.callAfter(service.push)
+            AppHelper.callAfter(refreshed)
         threading.Thread(target=work, daemon=True, name="plip-probe").start()
+
+    def refreshed() -> None:
+        """"Check again" / back to Settings: menu bar, island and brain catch up."""
+        from mcp_vision.buddy.engines import choose_engine
+
+        service.push()
+        if controller.companion is None and not state["building"] and \
+                choose_engine(state["settings"], registry.cached()) is not None:
+            rebuild(probe=False)                     # signed in elsewhere since: use it
+        else:
+            update_setup_error()
 
     def run_import(source: str) -> None:
         """Worker thread: read one source, merge it, refresh Settings."""
@@ -570,6 +664,17 @@ def run_buddy_app() -> None:
         update_setup_error()
         service.push()
 
+    def connected(engine_id: str) -> None:
+        """A brain finished connecting: re-probe and select it."""
+        registry.statuses(refresh=True)
+        AppHelper.callAfter(lambda: service.handle({"cmd": "select-engine", "id": engine_id}))
+
+    from mcp_vision.buddy.connect import Connector
+    from mcp_vision.buddy.engines import BY_ID, probe as probe_engine
+
+    connector = Connector(probe=lambda engine_id: probe_engine(BY_ID[engine_id], state["settings"]),
+                          on_change=lambda: AppHelper.callAfter(service.push), on_connected=connected)
+
     from mcp_vision.buddy.parakeet import ParakeetModel
 
     parakeet = ParakeetModel(on_change=lambda: AppHelper.callAfter(service.push),
@@ -583,7 +688,9 @@ def run_buddy_app() -> None:
         platform=Platform(
             copy=_copy, open_url=_open_url, run_in_terminal=_run_in_terminal,
             request_permission=request_permission, permissions=permissions, say=test_voice,
-            quit=lambda: AppKit.NSApp.terminate_(None), open_settings=open_settings, restart=restart),
+            quit=lambda: AppKit.NSApp.terminate_(None), open_settings=open_settings, restart=restart,
+            clipboard=_clipboard),
+        main=lambda job: AppHelper.callAfter(job),
         history=history,
         on_refresh=refresh_engines,
         memory=memory,
@@ -591,9 +698,14 @@ def run_buddy_app() -> None:
         action_log=ActionLog(),
         usage=usage_log,
         parakeet=parakeet,
+        connector=connector,
+        live=lambda: dict(presenter.live),
         account=account,
+        on_ask=ask_for_google,
         updates=updates,
         check_updates=lambda: check_updates(force=True),
+        hotkey_works=lambda: hotkey_mode() != "none",
+        apply_hotkey=lambda name: apply_hotkey(name),
     )
 
     def handle_command(command: dict[str, Any]) -> None:
@@ -608,11 +720,21 @@ def run_buddy_app() -> None:
             path = os.path.realpath(os.path.expanduser(str(command.get("path") or "")))
             if path.startswith(os.path.realpath(os.path.expanduser("~")) + os.sep) and os.path.exists(path):
                 default_host_cached().open(path)
+        elif name == "sound":
+            if command.get("name") in {"open", "close"}:
+                sounds.play(str(command["name"]))      # island opening / tucking back
         elif name == "stop":
-            if controller.companion is not None:
-                loop.call_soon_threadsafe(controller.companion.interrupt, None)
-            presenter.idle()
-        elif name not in {"ready", "island-rect"}:
+            stop()
+        elif name == "offer-answer":                          # Yes / No thanks under a suggestion
+            if command.get("accept"):
+                controller.ask("yes")
+            else:
+                if controller.companion is not None:
+                    loop.call_soon_threadsafe(controller.companion.decline)
+                presenter.idle()
+        elif name == "ready" and island is not None:          # island loaded: send it the shortcut
+            post_shortcut()
+        elif name != "island-rect":
             service.handle(command)
 
     def record_answer(future) -> None:
@@ -637,7 +759,16 @@ def run_buddy_app() -> None:
             controller.companion.conversation.clear()
         menu.set_status("Fresh start - conversation cleared")
 
+    def stop() -> None:
+        controller.stop()
+
+    def menu_opening() -> None:
+        companion = controller.companion
+        busy = controller.state != "idle" or bool(companion is not None and companion.busy)
+        menu.set_activity(busy, companion.unfinished if companion is not None else "")
+
     menu = StatusMenu({
+        "stop": stop, "resume": lambda: controller.ask("keep going"), "will_open": menu_opening,
         "settings": lambda: open_settings("home"), "brain": lambda: open_settings("brain"),
         "toggle_visible": toggle_visible, "clear": clear, "quit": lambda: AppKit.NSApp.terminate_(None),
         "report": lambda: open_settings("report"),
@@ -647,20 +778,30 @@ def run_buddy_app() -> None:
     controller.status = menu.set_status
 
     detector = ChordDetector(on_press=controller.on_press, on_release=controller.on_release,
-                             on_cancel=controller.on_cancel)
-    hotkeys = MacHotkeyListener(detector)
+                             on_cancel=controller.on_cancel, chord=chord(prefs.hotkey).mask)
+    hotkeys = state["hotkeys"] = MacHotkeyListener(detector)
     controller.hotkey_mode = hotkeys.start()
+    apply_hotkey(prefs.hotkey)
     _request_startup_permissions()
     rebuild(probe=True)
-    threading.Thread(target=account.refresh, daemon=True, name="plip-account").start()   # renew the sign-in once
+    def account_launch() -> None:
+        account.refresh()                              # renew the sign-in once
+        account.ensure_anonymous(retry_only=True)      # the walkthrough ended offline: the account it chose, now
+
+    threading.Thread(target=account_launch, daemon=True, name="plip-account").start()
     threading.Thread(target=watch_updates, daemon=True, name="plip-updates").start()      # a newer Plip?
 
-    if account.required or not prefs.onboarded:
-        # Sign-in first, then the welcome walkthrough until it calls finish-onboarding.
+    if not prefs.onboarded:
+        # The welcome walkthrough, until it calls finish-onboarding. Sign-in comes after the first task.
         AppHelper.callLater(0.8, lambda: open_settings("home"))
 
     log.info("plip running (hotkey=%s, web=%s)", controller.hotkey_mode, web)
-    print("Plip is in your menu bar and notch. Hold Control+Option and ask.", flush=True)
+    if controller.hotkey_mode == "none":
+        owner = keyboard_owner()
+        print(f"Plip can't hear {controller.shortcut} yet: macOS isn't passing keystrokes to {owner}. Turn {owner} "
+              "on in System Settings > Privacy & Security > Accessibility, then start Plip again.", flush=True)
+    else:
+        print(f"Plip is in your menu bar and notch. Hold {controller.shortcut} and ask.", flush=True)
     import atexit
 
     # Quitting: drop the warm brain process so nothing is left waiting for a question.

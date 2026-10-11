@@ -17,7 +17,12 @@ async function open(hash, viewport = { width: 1000, height: 700 }) {
   page.on('pageerror', (error) => errors.push(`${hash}: ${error.message}`))
   page.on('console', async (message) => {
     if (message.type() === 'error') errors.push(`${hash}: ${message.text()}`)
-    if (message.text().startsWith('[plip] command')) sent.push(await message.args()[1].jsonValue())
+    if (!message.text().startsWith('[plip] command')) return
+    try {
+      sent.push(await message.args()[1].jsonValue())
+    } catch {
+      // the page closed while this message was in flight (a preview timer after page.close()): nothing to keep
+    }
   })
   await page.goto(`${bundle}#${hash}`)
   await page.waitForTimeout(250)
@@ -62,6 +67,192 @@ await test('island: confirm card sends yes and no', async () => {
   await page.getByRole('button', { name: 'Cancel' }).click()
   assert.deepEqual((await take('confirm-action')), { cmd: 'confirm-action', accept: false })
   assert.equal(sent.filter((item) => item.cmd === 'confirm-action').length, 2)
+  await page.close()
+})
+
+await test('island: stays open while Plip is still talking, opens on hover only after a beat', async () => {
+  const { page, last, take } = await open('island', { width: 760, height: 420 })
+  await page.mouse.move(5, 400)
+  await setIsland(page, { phase: 'thinking', transcript: 'what is this' })
+  await page.waitForTimeout(400)
+  await page.getByRole('button', { name: 'Stop' }).click()                    // stop mid-thinking
+  assert.deepEqual(await take('stop'), { cmd: 'stop' })
+  await page.mouse.move(5, 400)                                               // off the island, or hover keeps it open
+  await setIsland(page, { phase: 'answering', answer: 'A long answer.', done: true, speaking: true })
+  await page.waitForTimeout(500)                                              // let the thinking view exit
+  await page.clock.install()
+  await page.clock.runFor(12000)                                              // past the linger: still talking
+  assert.equal(last('island-rect').mode, 'answering')
+  assert.equal(await page.getByRole('button', { name: 'Stop' }).count(), 1)   // voice still stoppable
+  await setIsland(page, { speaking: false })
+  await page.clock.runFor(7500)
+  await page.waitForTimeout(50)
+  assert.notEqual(last('island-rect').mode, 'answering')                      // done talking: tucked away
+  await setIsland(page, { phase: 'idle', hovered: true })
+  await page.clock.runFor(150)
+  assert.notEqual(last('island-rect').mode, 'peek')                           // passing by doesn't open it
+  await page.clock.runFor(400)
+  await page.waitForTimeout(50)
+  assert.equal(last('island-rect').mode, 'peek')
+  await page.close()
+})
+
+await test('island: a yes-or-no suggestion gets Yes and No thanks', async () => {
+  const { page, take } = await open('island', { width: 760, height: 420 })
+  await setIsland(page, { phase: 'answering', answer: 'Found three. Want me to add the cheapest to your cart?', done: true,
+    offer: 'Want me to add the cheapest to your cart?' })
+  await page.waitForTimeout(400)
+  await page.getByRole('button', { name: 'Yes' }).click()
+  assert.deepEqual(await take('offer-answer'), { cmd: 'offer-answer', accept: true })
+  assert.equal(await page.getByRole('button', { name: 'Yes' }).count(), 0)          // answered: the buttons go
+  await setIsland(page, { offer: 'Want me to keep going?' })
+  await page.getByRole('button', { name: 'No thanks' }).click()
+  assert.deepEqual(await take('offer-answer'), { cmd: 'offer-answer', accept: false })
+  await page.close()
+})
+
+await test('settings: one click connects a brain (no Terminal, nothing to copy)', async () => {
+  const { page, take } = await open('settings?tab=brain')
+  assert.equal(await page.getByText('Copy install command').count(), 0)
+  await page.getByRole('button', { name: 'Connect ChatGPT' }).click()
+  assert.equal((await take('engine-connect')).id, 'codex')
+  await page.getByText('Finish signing in to ChatGPT in your browser').waitFor()
+  await page.getByText('Browser didn’t open?').click()
+  await page.getByText('Open the sign-in page').waitFor()
+  await page.getByRole('button', { name: 'Copy link' }).click()                         // or any browser they like
+  assert.deepEqual(await take('copy'), { cmd: 'copy', text: 'https://claude.com/cai/oauth/authorize' })
+  await page.getByText('Copied').waitFor()
+  await page.getByPlaceholder('If the page shows a code, paste it here').fill('abc#123')
+  await page.getByRole('button', { name: 'Done' }).click()
+  assert.deepEqual(await take('engine-connect-code'), { cmd: 'engine-connect-code', id: 'codex', code: 'abc#123' })
+  await page.getByText('Finish signing in to ChatGPT in your browser').waitFor({ state: 'detached', timeout: 6000 })
+  assert.equal(await page.getByRole('button', { name: 'Connect ChatGPT' }).count(), 0)
+  await page.getByRole('button', { name: 'Connect Cursor' }).click()                // not installed: installs first
+  await page.getByText('Installing Cursor’s app').waitFor()
+  await page.getByRole('button', { name: 'Cancel' }).click()
+  assert.deepEqual(await take('engine-connect-cancel'), { cmd: 'engine-connect-cancel', id: 'cursor' })
+  // a sign-in that didn't finish keeps its link: open it, or copy it into any browser
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { engines: [
+    { id: 'claude-code', label: 'Claude', via: 'Claude Pro / Max via Claude Code', kind: 'subscription', status: 'logged-out',
+      connect: { state: 'failed', message: "Signing in to Claude didn't finish. Click Connect to try again.", url: 'https://claude.com/cai/oauth/authorize?x=9', needsCode: false } },
+  ] } }))
+  await page.getByText("Signing in to Claude didn't finish").first().waitFor()   // the quick card and Claude's card
+  await page.getByRole('button', { name: 'Copy link' }).first().click()
+  assert.deepEqual(await take('copy'), { cmd: 'copy', text: 'https://claude.com/cai/oauth/authorize?x=9' })
+  await page.getByRole('button', { name: 'Open the sign-in page' }).first().click()
+  assert.deepEqual(await take('open-url'), { cmd: 'open-url', url: 'https://claude.com/cai/oauth/authorize?x=9' })
+  await page.close()
+})
+
+await test('settings: no AI plan? a free Google key in three steps, checked before it counts', async () => {
+  const { page, take } = await open('settings?tab=brain')
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { engines: [
+    { id: 'claude-code', label: 'Claude', via: 'Claude Pro / Max via Claude Code', kind: 'subscription', status: 'not-installed' },
+    { id: 'codex', label: 'ChatGPT', via: 'ChatGPT Plus / Pro via Codex CLI', kind: 'subscription', status: 'not-installed' },
+    { id: 'anthropic', label: 'Claude API', via: 'Anthropic API key', kind: 'api', status: 'missing-key', keyName: 'ANTHROPIC_API_KEY' },
+    { id: 'gemini-api', label: 'Gemini', via: 'Free key from Google AI Studio', kind: 'api', status: 'missing-key', keyName: 'GEMINI_API_KEY' },
+  ] } }))
+  await page.getByText('If you pay for one of these').waitFor()
+  await page.getByText('No AI plan? Use Google’s for free').waitFor()
+  await page.getByRole('button', { name: 'Get my free key' }).click()
+  assert.deepEqual(await take('open-url'), { cmd: 'open-url', url: 'https://aistudio.google.com/apikey' })
+  await page.getByRole('button', { name: 'Paste key' }).click()
+  assert.deepEqual(await take('paste-key'), { cmd: 'paste-key' })
+  await page.getByText('Checking the key with Google').first().waitFor()
+  await page.getByText('Plip thinks with Gemini').waitFor({ timeout: 4000 })        // checked, saved, in use
+  await page.close()
+})
+
+await test('island: hovering the notch plips open and tucks back, once per hover, never for a question', async () => {
+  const { page, sent } = await open('island', { width: 760, height: 420 })
+  const sounds = () => sent.filter((item) => item.cmd === 'sound').map((item) => item.name)
+  await page.mouse.move(5, 400)
+  await setIsland(page, { phase: 'idle', hovered: true })
+  await page.waitForTimeout(900)                                   // 0.4 s hover delay, then stay open
+  await setIsland(page, { hovered: false })
+  await page.waitForTimeout(450)
+  assert.deepEqual(sounds(), ['open', 'close'])
+  for (const hovered of [true, false, true, false, true]) {     // jittery pointer on the edge
+    await setIsland(page, { hovered })
+    await page.waitForTimeout(60)
+  }
+  await page.waitForTimeout(900)
+  assert.deepEqual(sounds(), ['open', 'close', 'open'])
+  await setIsland(page, { hovered: false })
+  await page.waitForTimeout(450)
+  await setIsland(page, { phase: 'listening' })                   // mic is on: no sound
+  await page.waitForTimeout(450)
+  await setIsland(page, { phase: 'idle' })
+  await page.waitForTimeout(450)
+  assert.deepEqual(sounds(), ['open', 'close', 'open', 'close'])
+  await page.close()
+})
+
+await test('island: every open and close has its sound; a done task says Done and tucks sooner; bye tucks at once', async () => {
+  const { page, sent, last } = await open('island', { width: 760, height: 420 })
+  const sounds = () => sent.filter((item) => item.cmd === 'sound').map((item) => item.name)
+  await page.mouse.move(5, 400)
+  await setIsland(page, { phase: 'answering', answer: 'Opening it now.', done: false, speaking: true })
+  await page.waitForTimeout(500)
+  assert.deepEqual(sounds(), ['open'])                              // opened from the notch (not by the mic)
+  await page.getByRole('button', { name: 'Minimize' }).click()
+  await page.mouse.move(5, 400)
+  await page.waitForTimeout(500)
+  assert.deepEqual(sounds(), ['open', 'close'])                     // tucked into the notch
+  await setIsland(page, { hovered: true })
+  await page.waitForTimeout(700)
+  assert.deepEqual(sounds(), ['open', 'close', 'open'])             // opened again from mini
+  await setIsland(page, { hovered: false, done: true, speaking: false, finished: 'done' })
+  await page.waitForTimeout(300)
+  assert.equal(await page.getByText('Done', { exact: true }).count(), 1)
+  await page.waitForTimeout(3800)                                   // 3.5 s, not 7
+  assert.notEqual(last('island-rect').mode, 'answering')
+  assert.deepEqual(sounds(), ['open', 'close', 'open', 'close'])
+  await page.evaluate(() => window.__plip({ type: 'reset' }))
+  await setIsland(page, { phase: 'listening' })                    // "bye" said with ⌃⌥: no open, the mic's on
+  await page.waitForTimeout(400)
+  await setIsland(page, { phase: 'answering', answer: 'See you.', done: true, speaking: false, finished: 'bye' })
+  await page.waitForTimeout(1500)
+  assert.notEqual(last('island-rect').mode, 'answering')            // a goodbye tucks right after the voice
+  assert.deepEqual(sounds(), ['open', 'close', 'open', 'close', 'close'])
+  await page.close()
+})
+
+await test('island (as in the app): a stale pointer hover never keeps it open; an error card goes back to idle', async () => {
+  const page = await browser.newPage({ viewport: { width: 760, height: 420 } })
+  const sent = []
+  await page.exposeFunction('__sent', (body) => sent.push(JSON.parse(body)))
+  await page.addInitScript(() => { window.webkit = { messageHandlers: { plip: { postMessage: (body) => window.__sent(body) } } } })
+  await page.goto(`${bundle}#island`)
+  await page.waitForTimeout(300)
+  const mode = () => [...sent].reverse().find((item) => item.cmd === 'island-rect')?.mode
+  await setIsland(page, { phase: 'idle', hovered: false })
+  await page.mouse.move(380, 18)                                    // the pointer sits on the notch...
+  await page.waitForTimeout(600)
+  assert.equal(mode(), 'compact')                                   // ...but only the native hover counts
+  await setIsland(page, { hovered: true })
+  await page.waitForTimeout(600)
+  assert.equal(mode(), 'peek')
+  await setIsland(page, { hovered: false })                         // left; WebKit never sent mouseleave
+  await page.waitForTimeout(200)
+  assert.equal(mode(), 'compact')                                   // was stuck open here
+  await setIsland(page, { phase: 'error', error: 'I didn’t catch that.' })
+  await page.waitForTimeout(300)
+  assert.equal(mode(), 'error')
+  await page.waitForTimeout(8200)
+  assert.equal(mode(), 'compact')                                   // back to idle after a quiet spell
+  await page.close()
+})
+
+await test('island: only a setup error offers Fix setup', async () => {
+  const { page, take } = await open('island', { width: 760, height: 420 })
+  await setIsland(page, { phase: 'error', error: 'I didn’t catch that. Hold ⌃⌥ and try again.', fixable: false })
+  await page.waitForTimeout(400)
+  assert.equal(await page.getByRole('button', { name: 'Fix setup' }).count(), 0)
+  await setIsland(page, { phase: 'error', error: 'I need you to sign in to my brain first. Open my settings and pick a brain.', fixable: true })
+  await page.waitForTimeout(400)
+  await page.getByRole('button', { name: 'Fix setup' }).click()
+  assert.deepEqual(await take('open-settings'), { cmd: 'open-settings', tab: 'brain' })
   await page.close()
 })
 
@@ -126,10 +317,100 @@ await test('settings: general (companion style, walkthroughs, tour)', async () =
   assert.deepEqual((await take('set-companion')), { cmd: 'set-companion', style: 'cursor' })
   await page.getByRole('switch', { name: 'Guided walkthroughs' }).click()
   assert.deepEqual((await take('set-walkthroughs')), { cmd: 'set-walkthroughs', enabled: false })
+  await page.getByRole('switch', { name: 'Sounds' }).click()
+  assert.deepEqual((await take('set-sounds')), { cmd: 'set-sounds', enabled: false })
   await page.getByRole('button', { name: /Replay the welcome tour/ }).click()
   assert.ok(await take('tour-start'))
   await page.getByText('Hi, I’m Plip').waitFor()
   await page.close()
+})
+
+await test('onboarding: plain steps, a brain without a terminal, practice, then done; no sign-in step', async () => {
+  const { page, take } = await open('settings?tab=home')
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { onboarded: false, tour: { step: 'welcome' },
+    account: { available: true, identified: false, anonymous: false, prompt: false, status: '', user: null },
+    permissions: { screen: true, accessibility: null, microphone: true, speech: null }, voice: { tts: 'say', stt: 'apple', elevenlabs: false, assemblyai: false },
+    engines: [
+      { id: 'claude-code', label: 'Claude', via: 'Claude Pro / Max via Claude Code', kind: 'subscription', status: 'not-installed' },
+      { id: 'codex', label: 'ChatGPT', via: 'ChatGPT Plus / Pro via Codex CLI', kind: 'subscription', status: 'logged-out' },
+      { id: 'gemini-api', label: 'Gemini', via: 'Free key from Google AI Studio', kind: 'api', status: 'missing-key', keyName: 'GEMINI_API_KEY' },
+    ] } }))
+  await page.getByText('Hi, I’m Plip').waitFor()
+  await page.getByText('no sign-in needed').waitFor()
+  await page.getByRole('button', { name: 'Set me up' }).click()
+  assert.deepEqual(await take('tour-go'), { cmd: 'tour-go', step: 'permissions' })    // saved for restarts
+  await page.getByText('Let Plip see and hear you').waitFor()
+  await page.getByText('Step 1 of 3').waitFor()                                     // permissions, brain, try
+  await page.getByText('Microphone and Speech Recognition').waitFor()               // Apple's listening needs both
+  await page.getByRole('button', { name: 'Allow', exact: true }).first().click()
+  assert.deepEqual(await take('grant'), { cmd: 'grant', permission: 'accessibility' })
+  await page.getByRole('button', { name: 'Skip for now' }).click()
+  await page.getByText('Give Plip a brain').waitFor()
+  assert.equal(await page.getByText(/terminal|npm i/i).count(), 0)                   // no commands to run, anywhere
+  await page.getByRole('button', { name: 'Connect', exact: true }).first().click()
+  assert.deepEqual(await take('engine-connect'), { cmd: 'engine-connect', id: 'claude-code' })
+  await page.getByText('No AI plan? Use Google’s for free').waitFor()
+  await page.getByRole('button', { name: 'Paste key' }).click()
+  await page.getByText('Hold Control + Option and ask').waitFor({ timeout: 8000 })   // a working brain moves it on
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { live: { phase: 'done', transcript: 'what can you do',
+    answer: 'I can see your screen and point at things.', error: '', at: Date.now() / 1000 + 5 } } }))
+  await page.getByText('That’s all there is to it').waitFor()
+  await page.getByRole('button', { name: 'Continue' }).click()
+  await page.getByText('You’re all set').waitFor()                                  // straight to done: no sign-in step
+  assert.equal(await page.getByText('Continue with Google').count(), 0)
+  await page.getByText(/guest name/).waitFor()                                      // and it says the guest account is coming
+  await page.getByRole('button', { name: 'Start using Plip' }).click()
+  assert.deepEqual(await take('finish-onboarding'), { cmd: 'finish-onboarding' })
+  await page.locator('nav').getByRole('button', { name: /Account$/ }).click()
+  await page.getByText('Quiet Nomad').first().waitFor()                             // a guest, named
+  await page.getByText('Guest', { exact: true }).waitFor()
+  await page.close()
+})
+
+await test('onboarding: skip setup finishes it as a guest, and a build without accounts says nothing about one', async () => {
+  const { page, take } = await open('settings?tab=home')
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { onboarded: false, tour: { step: 'welcome' },
+    account: { available: true, identified: false, anonymous: false, prompt: false, status: '', user: null } } }))
+  await page.getByText('Hi, I’m Plip').waitFor()
+  await page.getByRole('button', { name: 'Skip setup' }).click()
+  assert.deepEqual(await take('finish-onboarding'), { cmd: 'finish-onboarding', skipped: true })
+  assert.equal(await page.getByText('Hi, I’m Plip').count(), 0)
+  await page.locator('nav').getByRole('button', { name: /Account$/ }).click()
+  await page.getByText('Quiet Nomad').first().waitFor()
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { onboarded: false, tour: { step: 'try' }, account: { available: false, identified: false, anonymous: false, prompt: false } } }))
+  await page.getByRole('button', { name: 'Try it later' }).click()
+  assert.deepEqual(await take('tour-go'), { cmd: 'tour-go', step: 'done' })
+  await page.getByText('You’re all set').waitFor()
+  assert.equal(await page.getByText(/guest name/).count(), 0)
+  await page.close()
+})
+
+await test('general: the talk shortcut is picked here, and every "hold" hint follows it', async () => {
+  const { page, take } = await open('settings?tab=general')
+  await page.getByText('Hold Control + Option, talk, then let go.').waitFor()
+  assert.equal(await page.getByRole('alert').count(), 0)
+  await page.getByRole('button', { name: 'Option + Command' }).click()
+  assert.deepEqual(await take('set-hotkey'), { cmd: 'set-hotkey', id: 'option+command' })
+  // Python's reply: new shortcut, host terminal can't see keys
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { hotkey: {
+    id: 'option+command', keys: ['⌥', '⌘'], label: 'Option + Command', works: false, owner: 'Terminal',
+    choices: [{ id: 'control+option', keys: ['⌃', '⌥'], label: 'Control + Option' }, { id: 'option+command', keys: ['⌥', '⌘'], label: 'Option + Command' }] } } }))
+  await page.getByText('Hold Option + Command, talk, then let go.').waitFor()
+  const alert = page.getByRole('alert')
+  assert.match(await alert.innerText(), /macOS isn’t passing your keys to Terminal, so ⌥⌘ does nothing yet/)
+  await alert.getByRole('button', { name: 'Open Accessibility' }).click()
+  assert.deepEqual(await take('grant'), { cmd: 'grant', permission: 'accessibility' })
+  assert.deepEqual(await page.locator('aside kbd').allInnerTexts(), ['⌥', '⌘'])        // the sidebar's hint
+  await page.close()
+  const island = await open('island', { width: 760, height: 420 })
+  await island.page.evaluate(() => window.__plip({ type: 'shortcut', state: { id: 'control+shift', keys: ['⌃', '⇧'], label: 'Control + Shift' } }))
+  await setIsland(island.page, { phase: 'idle', hovered: true })
+  await island.page.getByText('and ask, or tell me to do something').waitFor()
+  assert.deepEqual(await island.page.locator('kbd').allInnerTexts(), ['⌃', '⇧'])
+  await island.page.evaluate(() => window.__plip({ type: 'shortcut', state: { id: 'control+shift', keys: ['⌃', '⇧'], label: 'Control + Shift', works: false } }))
+  await island.page.getByText('Your shortcut is off until you allow Accessibility').waitFor()   // not "hold ⌃⇧" for nothing
+  await island.page.getByRole('button', { name: 'Allow' }).click()
+  await island.page.close()
 })
 
 await test('general: report a bug and request a feature, one open at a time', async () => {
@@ -170,6 +451,10 @@ await test('settings: usage tab switches periods and clears', async () => {
     assert.ok(await page.locator('li', { hasText: label }).first().isVisible(), label)       // the legend rows
   }
   await page.getByRole('button', { name: 'Clear usage' }).click()
+  await page.getByText('This can’t be undone.').waitFor()                         // asks before wiping it
+  await page.getByRole('button', { name: 'Cancel' }).click()
+  await page.getByRole('button', { name: 'Clear usage' }).click()
+  await page.getByRole('button', { name: 'Clear', exact: true }).click()
   assert.ok(await take('clear-usage'))
   await page.close()
 })
@@ -201,9 +486,17 @@ await test('guide: the permission card says what to drag, closes, and shows the 
   await page.close()
 })
 
-await test('sign in: google comes first, then plip; sign out brings it back', async () => {
+await test('sign in: never a wall; after the first task home asks once, later hides it, google links the account', async () => {
   const { page, take } = await open('settings?signin')
-  assert.equal(await page.locator('nav').count(), 0)                     // nothing else until they sign in
+  await page.locator('nav').waitFor()                                      // settings are all there, no sign-in screen
+  await page.getByText('Make this Plip yours').waitFor()                   // the card, as after the first task
+  await page.getByText('Quiet Nomad').first().waitFor()
+  await page.getByRole('button', { name: 'Later' }).click()
+  assert.ok(await take('account-later'))
+  assert.equal(await page.getByText('Make this Plip yours').count(), 0)
+  await page.locator('nav').getByRole('button', { name: /Account$/ }).click()
+  await page.getByText('Your Plip, so far').waitFor()
+  await page.getByText('Guest', { exact: true }).waitFor()
   await page.getByRole('button', { name: 'Continue with Google' }).click()
   assert.deepEqual(await take('account-sign-in'), { cmd: 'account-sign-in', provider: 'google' })
   await page.getByText('Finish signing in in your browser').waitFor()
@@ -212,24 +505,29 @@ await test('sign in: google comes first, then plip; sign out brings it back', as
   await page.getByRole('button', { name: 'Cancel' }).click()
   assert.ok(await take('account-cancel'))
   await page.getByRole('button', { name: 'Continue with Google' }).click()
-  const account = page.locator('nav').getByRole('button', { name: /Account$/ })
-  await account.waitFor({ timeout: 4000 })                                // the preview "comes back" signed in
-  await account.click()
-  await page.getByText('hussain@plip.dev').waitFor()
+  await page.getByText('hussain@plip.dev').waitFor({ timeout: 4000 })      // the preview "comes back" linked
+  await page.getByText('Signed in').waitFor()
+  assert.equal(await page.locator('img').count(), 0)                      // no picture: their initial
+  const picture = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+  await page.evaluate((src) => window.__plip({ type: 'settings', state: { account: { available: true, identified: true, anonymous: false, prompt: false, status: '',
+    user: { name: 'Hussain Syed', email: 'hussain@plip.dev', provider: 'google', since: 1789862400, picture: src } } } }), picture)
+  await page.locator('nav img').waitFor()                                   // their Google picture, sidebar and card
+  assert.equal(await page.locator('main img').getAttribute('src'), picture)
   await page.getByRole('button', { name: 'Sign out' }).click()
   assert.ok(await take('account-sign-out'))
-  await page.getByRole('button', { name: 'Continue with Google' }).waitFor()
+  await page.getByText('Guest', { exact: true }).waitFor()                 // a guest again, still working
   await page.close()
 })
 
-await test('sign in: a failed sign-in says why, and a build without sign-in never shows it', async () => {
+await test('sign in: a failed sign-in says why, and a build without accounts has no account tab', async () => {
   const { page } = await open('settings?signin')
-  await page.evaluate(() => window.__plip({ type: 'settings', state: { account: { available: true, required: true, status: 'failed', error: 'You said no' } } }))
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { account: { available: true, identified: false, anonymous: true, prompt: true, status: 'failed', error: 'You said no', user: { name: 'Quiet Nomad', email: '', provider: 'anonymous', since: null } } } }))
   await page.getByRole('alert').getByText('You said no').waitFor()
   await page.getByRole('button', { name: 'Try again with Google' }).waitFor()
-  await page.evaluate(() => window.__plip({ type: 'settings', state: { account: { available: false, required: false } } }))
+  await page.evaluate(() => window.__plip({ type: 'settings', state: { account: { available: false, identified: false, anonymous: false, prompt: false } } }))
   await page.locator('nav').waitFor()
   assert.equal(await page.locator('nav').getByRole('button', { name: /Account$/ }).count(), 0)
+  assert.equal(await page.getByText('Make this Plip yours').count(), 0)
   await page.close()
 })
 

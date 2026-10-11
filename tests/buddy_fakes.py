@@ -23,9 +23,11 @@ class ScriptedBrain:
         self.replies = list(replies)
         self.chunk = chunk
         self.calls = []
+        self.systems = []
 
     async def stream(self, *, system, turns, detailed=False):
         self.calls.append(turns)
+        self.systems.append(system)
         reply = self.replies.pop(0) if self.replies else "okay."
         for start in range(0, len(reply), self.chunk):
             yield reply[start:start + self.chunk]
@@ -93,6 +95,7 @@ class FakeHost:
     def __init__(self, home="/Users/test", apps=None, shortcuts=None, osa_reply=""):
         self.home = home
         self.calls = []
+        self.pointed = []             # where clicks, scrolls and hovers moved the pointer
         self.apps = apps if apps is not None else {
             "safari": "/Applications/Safari.app", "google chrome": "/Applications/Google Chrome.app",
             "visual studio code": "/Applications/Visual Studio Code.app", "messages": "/System/Applications/Messages.app",
@@ -139,10 +142,46 @@ class FakeHost:
         self.calls.append(("replace", text))
 
     def click(self, x, y, button="left", count=1):
+        self.pointed.append((round(x), round(y)))
         self.calls.append(("click", round(x), round(y)) + ((button, count) if (button, count) != ("left", 1) else ()))
 
     def scroll(self, x, y, dy, dx=0):
+        self.pointed.append((round(x), round(y)))
         self.calls.append(("scroll", round(x), round(y), dy, dx))
+
+    # scroll fallbacks when the wheel moves nothing (tests set)
+    mouse = None                      # user's pointer, global points
+    focused_area = None               # Rect of the focused scroll area
+    focus_role = None                 # e.g. "AXWebArea"; None: unknown
+    has_bar = False                   # has a scroll bar Plip can move
+    revealed = None                   # scroll_to_visible's Reveal
+    revealed_now = None               # its answer with ask=False (default: same)
+
+    def hover(self, x, y):
+        self.pointed.append((round(x), round(y)))
+
+    def mouse_position(self):
+        return self.mouse
+
+    def focused_scroll_area(self):
+        return self.focused_area
+
+    def focused_role(self):
+        return self.focus_role
+
+    def scroll_bar_step(self, x, y, direction, *, to_end=False, pages=1.0, within=None):
+        if not self.has_bar:
+            return False
+        self.calls.append(("scroll_bar", round(x), round(y), direction, to_end))
+        return True
+
+    def scroll_to_visible(self, text, *, ask=True):
+        from mcp_vision.buddy.actions.host import Reveal
+
+        if not ask:
+            return self.revealed_now or self.revealed or Reveal()
+        self.calls.append(("scroll_to_visible", text))
+        return self.revealed or Reveal()
 
     def press(self, keys):
         self.calls.append(("press", keys))

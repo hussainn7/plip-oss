@@ -8,12 +8,17 @@ island's current shape, which the web UI reports as it animates.
 """
 from __future__ import annotations
 
+import math
+import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
 from mcp_vision.buddy.web_host import WebSurface
 
 WIDTH, HEIGHT = 760.0, 420.0
+YIELD_SECONDS = 1.0                            # Plip's click/scroll/drag owns the screen this long
+PARK_SLOP = 3.0                                # points a parked cursor drifts before it's the user's
 HOVER_MARGIN = 6.0
 _CLASSES: dict[str, type] = {}
 
@@ -89,6 +94,25 @@ def _ticker_class():
     return _CLASSES["ticker"]
 
 
+class HoverGate:
+    """Whether the island takes the mouse: not while Plip uses it, nor until the user moves it after."""
+
+    def __init__(self) -> None:
+        self.parked: tuple[float, float] | None = None
+        self.until = 0.0
+
+    def plip_moved(self, point: tuple[float, float], now: float, hold: float = YIELD_SECONDS) -> None:
+        self.parked = point
+        self.until = max(self.until, now + hold)
+
+    def takes(self, mouse: tuple[float, float], over: bool, now: float) -> bool:
+        if self.parked is not None:
+            if now < self.until or math.dist(mouse, self.parked) <= PARK_SLOP:
+                return False
+            self.parked = None                     # the user moved it: theirs again
+        return over
+
+
 class IslandWindow:
     def __init__(self, on_command: Callable[[dict[str, Any]], None]):
         import AppKit
@@ -114,20 +138,20 @@ class IslandWindow:
         panel.setReleasedWhenClosed_(False)
         panel.setIgnoresMouseEvents_(True)
         panel.setAcceptsMouseMovedEvents_(True)
-        try:
-            panel.setSharingType_(AppKit.NSWindowSharingNone)
-        except Exception:
-            pass
         self.surface = WebSurface("island", rect, self._command)
         panel.setContentView_(self.surface.view)
         self.panel = panel
         self.place()
         panel.orderFrontRegardless()
         self._interactive = False
+        self.gate = HoverGate()
         self._ticker = _ticker_class().alloc().initWithCallback_(self._tick)
         self._timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             1 / 30, self._ticker, "fire:", None, True)
         AppKit.NSRunLoop.mainRunLoop().addTimer_forMode_(self._timer, AppKit.NSRunLoopCommonModes)
+        from mcp_vision.buddy.clear_path import on_clear
+
+        self._stop_clearing = on_clear(self._clear)      # Plip's clicks pass through to the app below
         center = AppKit.NSNotificationCenter.defaultCenter()
         self._screens_changed = center.addObserverForName_object_queue_usingBlock_(
             AppKit.NSApplicationDidChangeScreenParametersNotification, None, None,
@@ -155,14 +179,47 @@ class IslandWindow:
             self.surface.post([{"type": "island", "state": {"notch": self.geometry}}])
         self.on_command(command)
 
+    # -- Plip's own clicks (clear_path) --------------------------------------------------------
+    def _clear(self, points: list[tuple[float, float]], act: bool) -> None:
+        """Any thread; returns once the island is out of the next click's way."""
+        if not act or not points:
+            return
+        if threading.current_thread() is threading.main_thread():
+            self.make_way(points)
+            return
+        from PyObjCTools import AppHelper
+
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                self.make_way(points)
+            finally:
+                done.set()
+        AppHelper.callAfter(run)
+        done.wait(0.3)
+
+    def make_way(self, points: list[tuple[float, float]]) -> None:
+        """Main thread: click-through for Plip's mouse; its parked cursor isn't a hover."""
+        import AppKit
+
+        primary = float(AppKit.NSScreen.screens()[0].frame().size.height)
+        x, y = points[-1]
+        self.gate.plip_moved((x, primary - y), time.monotonic())        # global top-left -> AppKit
+        if self._interactive:
+            self._interactive = False
+            self.panel.setIgnoresMouseEvents_(True)
+            self.surface.post([{"type": "island", "state": {"hovered": False}}])
+
     def _tick(self) -> None:
         import AppKit
 
         mouse = AppKit.NSEvent.mouseLocation()
         frame = self.panel.frame()
-        inside = island_hit((float(mouse.x), float(mouse.y)),
-                            (float(frame.origin.x), float(frame.origin.y), float(frame.size.width), float(frame.size.height)),
-                            self.island_size)
+        over = island_hit((float(mouse.x), float(mouse.y)),
+                          (float(frame.origin.x), float(frame.origin.y), float(frame.size.width), float(frame.size.height)),
+                          self.island_size)
+        inside = self.gate.takes((float(mouse.x), float(mouse.y)), over, time.monotonic())
         if inside != self._interactive:
             self._interactive = inside
             self.panel.setIgnoresMouseEvents_(not inside)

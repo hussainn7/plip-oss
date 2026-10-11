@@ -40,6 +40,81 @@ def answer_kind(text: str) -> str:
     return "yes" if plain and any(word in YES_WORDS for word in words) else ""
 
 
+# consequential doings; a yes covers a step only if both name the same one
+_DOINGS = {
+    "send": r"send|sending",
+    "delete": r"delete|deleting|remove|removing|erase|erasing|trash|trashing|discard|discarding|wipe|wiping",
+    "submit": r"submit|submitting",
+    "post": r"post|posting|publish|publishing",
+    "apply": r"apply|applying",
+    "tidy": r"tidy|tidying|organi[sz]e|organi[sz]ing|clean(?:ing)? (?:it |them |this |that )?up",
+    "fill": r"fill|filling",
+    "attach": r"attach|attaching|upload|uploading",
+    "quit": r"quit|quitting|cmd\+q",
+    "sign out": r"(?:sign|log)(?:ging)? ?out|logout",
+    "unsubscribe": r"unsubscribe|unsubscribing",
+    "merge": r"merge|merging",
+    "deploy": r"deploy|deploying",
+}
+_DOING_RES = {name: re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE) for name, pattern in _DOINGS.items()}
+# spending money always gets its card
+MONEY_RE = re.compile(r"\b(buy|buying|purchas\w*|order|ordering|pay|paying|payment|checkout|check ?out|book|booking|"
+                      r"reserv\w*|transfer\w*|donat\w*|subscribe|subscribing|tip)\b|[$€£¥]", re.IGNORECASE)
+_HOLD_RE = re.compile(r"\b(don'?t|do not|not|never|no|wait|hold|later|before|after|unless|instead|yet|first)\b",
+                      re.IGNORECASE)
+_ASKING_RE = re.compile(r"^\W*(should|shall|do(?!\s+(it|that|this|so)\b)|does|did|is|are|was|what|why|how|when|where|"
+                        r"which|who|whose)\b", re.IGNORECASE)
+_POINTING_RE = re.compile(r"\b(it|that|this|them|these|those)\b", re.IGNORECASE)
+# words that don't say what a step is about
+_FILLER = {"the", "and", "for", "you", "your", "want", "should", "shall", "can", "could", "would", "like", "now", "ahead",
+           "click", "press", "button", "yes", "with", "into", "from", "this", "that", "them", "these", "those", "its",
+           "all", "just", "okay", "sure", "then", "too", "also", "about", "going", "will", "let", "please", "here"}
+
+
+def _about(text: str) -> set[str]:
+    """Words saying what a sentence or card is about, minus doings and filler."""
+    words = {word for word in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(word) > 2 and word not in _FILLER}
+    return {word for word in words if not any(pattern.fullmatch(word) for pattern in _DOING_RES.values())}
+
+
+def doings(text: str) -> set[str]:
+    """Consequential doings a sentence names, e.g. {"send"}."""
+    return {name for name, pattern in _DOING_RES.items() if pattern.search(text or "")}
+
+
+@dataclass
+class Consent:
+    """A yes to Plip's own question: skips the next matching card once (never money, a firm card or a "but")."""
+
+    doings: set[str]
+    about: set[str] = field(default_factory=set)    # what the question was about
+    pointing: bool = False                          # question said "it"/"that"
+
+    @classmethod
+    def given(cls, transcript: str, asked: str = "") -> Consent | None:
+        text = " ".join((transcript or "").split())
+        if not asked or answer_kind(text) != "yes" or _ASKING_RE.match(text):
+            return None
+        if MONEY_RE.search(asked) or MONEY_RE.search(text):
+            return None                                # money always gets its card
+        if _HOLD_RE.search(YES_RE.sub("", text, count=1)):
+            return None
+        found = doings(asked)                          # what Plip asked, not what they added
+        if not found:
+            return None
+        question = re.findall(r"[^.!?]*\?", asked)
+        return cls(found, _about(asked), bool(_POINTING_RE.search(question[-1] if question else asked)))
+
+    def covers(self, preview: Preview) -> bool:
+        """Next card only: same doing and same subject, or a bare button for the "it" just asked about."""
+        text = f"{preview.title} {preview.confirm}"
+        doing, self.doings = self.doings, set()       # one card per yes
+        if preview.firm or MONEY_RE.search(text) or not doing & doings(text):
+            return False
+        target = _about(preview.title)
+        return bool(target & self.about) if target else self.pointing
+
+
 @dataclass
 class Pending:
     spec: ActionSpec
@@ -56,10 +131,16 @@ class Outcome:
     result: ActionResult | None = None
     preview: Preview | None = None
     message: str = ""
+    agreed: bool = False           # card skipped: they'd already said yes
+    hint: str = ""                 # model-only: what to try instead
 
     @property
     def label(self) -> str:
         return self.spec.describe(self.args) if self.spec else "That action"
+
+
+_PRIVATE_ARGS = {"text", "body", "fields", "fact", "value", "key", "query", "title", "about", "path", "near", "field",
+                 "label", "due", "from", "to", "depart", "return"}
 
 
 class ActionLog:
@@ -71,7 +152,12 @@ class ActionLog:
         self.path = path or state_dir() / "actions.jsonl"
 
     def add(self, name: str, args: dict, ok: bool, source: str = "voice") -> None:
-        safe = {key: value for key, value in args.items() if key not in {"text", "body", "fields", "fact"}}
+        # what kind of thing, never what about; links by site only
+        safe = {key: value for key, value in args.items() if key not in _PRIVATE_ARGS}
+        if isinstance(safe.get("url"), str):
+            from urllib.parse import urlparse
+
+            safe["url"] = urlparse(safe["url"] if "://" in safe["url"] else "https://" + safe["url"]).netloc
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
@@ -122,7 +208,8 @@ class ActionEngine:
                 for spec in self.specs.values()]
 
     # -- running -----------------------------------------------------------------------------
-    async def handle(self, name: str, args: dict | None = None) -> Outcome:
+    async def handle(self, name: str, args: dict | None = None, consent: Consent | None = None) -> Outcome:
+        """Run an action, or hold it for a yes (unless ``consent`` covers it)."""
         args = dict(args or {})
         spec = self.specs.get(name)
         if spec is None:
@@ -135,11 +222,15 @@ class ActionEngine:
                                                  self.timeout)
                 preview = await maybe_await(preview)
             except ActionError as exc:
-                return Outcome("failed", spec, args, message=str(exc))
+                return Outcome("failed", spec, args, message=str(exc), hint=exc.hint)
             except Exception as exc:
                 return Outcome("failed", spec, args, message=_friendly(exc))
             if preview is None:                         # this one needs no yes (a plain click, an ordinary key)
                 return await self._run(spec, args)
+            if consent is not None and consent.covers(preview):
+                outcome = await self._run(spec, args, preview.state)
+                outcome.agreed = True
+                return outcome
             self.pending = Pending(spec, args, preview)
             return Outcome("pending", spec, args, preview=preview)
         return await self._run(spec, args)
@@ -166,7 +257,7 @@ class ActionEngine:
             result = await maybe_await(value)
         except ActionError as exc:
             self._log(spec, args, False)
-            return Outcome("failed", spec, args, message=str(exc))
+            return Outcome("failed", spec, args, message=str(exc), hint=exc.hint)
         except asyncio.TimeoutError:
             self._log(spec, args, False)
             return Outcome("failed", spec, args, message="That took too long, so I stopped.")

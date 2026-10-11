@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react'
-import { ArrowUpRight, Check, ChevronDown, LoaderCircle, Play } from 'lucide-react'
+import { ArrowUpRight, Check, ChevronDown, LoaderCircle, Play, TriangleAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { send, settings, type SettingsState } from '../../bridge'
 import { cn } from '../../components/bits'
@@ -31,6 +31,7 @@ export function GeneralTab({ state, composer: initial = null }: { state: Setting
 
       <Section title="Behavior">
         <Rows>
+          <ShortcutRow state={state} />
           <Row
             title="Where Plip lives"
             detail={LIVES[state.companion]}
@@ -42,6 +43,11 @@ export function GeneralTab({ state, composer: initial = null }: { state: Setting
             title="Guided walkthroughs"
             detail="A checklist in the notch. Plip waits for you and re-checks each step."
             action={<Toggle label="Guided walkthroughs" checked={state.walkthroughs} onChange={(enabled) => send('set-walkthroughs', { enabled })} />}
+          />
+          <Row
+            title="Sounds"
+            detail="A soft plip when the notch opens or you let go of ⌃⌥, a little bounce when a task is done."
+            action={<Toggle label="Sounds" checked={state.sounds} onChange={(enabled) => send('set-sounds', { enabled })} />}
           />
         </Rows>
       </Section>
@@ -88,6 +94,32 @@ export function GeneralTab({ state, composer: initial = null }: { state: Setting
         </Rows>
       </Section>
     </div>
+  )
+}
+
+/** Hold-to-talk keys, warning when macOS blocks them. */
+function ShortcutRow({ state }: { state: SettingsState }) {
+  const { hotkey } = state
+  return (
+    <>
+      <Row
+        title="Talk shortcut"
+        detail={`Hold ${hotkey.label}, talk, then let go. Pressing another key with it cancels.`}
+        action={<Segmented value={hotkey.id}
+          options={hotkey.choices.map((choice) => ({ value: choice.id, label: choice.keys.join(''), hint: choice.label }))}
+          onChange={(id) => send('set-hotkey', { id })} />}
+      />
+      {!hotkey.works && (
+        <div role="alert" className="!border-t-0 flex items-center gap-3 px-5 pb-3.5 text-[12px] leading-relaxed text-sun">
+          <TriangleAlert className="size-4 shrink-0" />
+          <div className="flex-1">
+            macOS isn’t passing your keys to {hotkey.owner}, so {hotkey.keys.join('')} does nothing yet.
+            Turn {hotkey.owner} on in Accessibility{hotkey.owner === 'Plip' ? '' : ', then start Plip again'}.
+          </div>
+          <Button size="sm" variant="ghost" onClick={() => send('grant', { permission: 'accessibility' })}>Open Accessibility</Button>
+        </div>
+      )}
+    </>
   )
 }
 

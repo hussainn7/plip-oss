@@ -2,7 +2,7 @@
 
 Subscription engines drive a CLI the user is already signed in to (Claude
 Code with a Claude Pro/Max plan, Codex with ChatGPT Plus/Pro, Cursor's
-agent, Gemini CLI with a Google account), so their plan pays for the
+agent, Gemini on a Google AI plan via Antigravity), so their plan pays for the
 reasoning and no API key is needed. API engines use a key instead.
 
 Each CLI runs once per turn in an empty temporary directory with its tools
@@ -31,12 +31,15 @@ from mcp_vision.buddy.usage import Usage, from_report
 
 # GUI apps launched from Finder get a bare PATH; look where installers put CLIs.
 SEARCH_DIRS = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
-               "~/.bun/bin", "~/.volta/bin", "~/.cursor/bin", "~/.codex/bin", "~/bin", "/usr/bin")
+               "~/.bun/bin", "~/.volta/bin", "~/.cursor/bin", "~/.codex/bin", "~/.gemini/bin", "~/bin", "/usr/bin")
 NVM_GLOB = "~/.nvm/versions/node/*/bin"
 
 
 class EngineError(RuntimeError):
     """The engine ran but couldn't answer (signed out, rate limited, crashed)."""
+
+
+RAN_TOOLS = "tried to run a command on your Mac, which Plip doesn't allow"
 
 
 @dataclass(frozen=True)
@@ -65,15 +68,18 @@ SPECS: tuple[EngineSpec, ...] = (
                binaries=("cursor-agent", "agent"), login="agent login",
                install="curl https://cursor.com/install -fsS | bash",
                blurb="Text only: Plip reads the screen's controls out to it."),
-    EngineSpec("gemini", "Gemini", "Google account via Gemini CLI", "subscription", True,
-               binaries=("gemini",), login="gemini", install="npm i -g @google/gemini-cli",
-               blurb="Sees your screenshots on your Google account's free or paid tier."),
+    EngineSpec("antigravity", "Gemini", "Google AI Pro / Ultra via Antigravity", "subscription", False,
+               binaries=("agy",), login="agy", install="https://antigravity.google",
+               blurb="Your Google AI plan through Antigravity's CLI, its tools off. Text only: Plip reads it the screen."),
     EngineSpec("anthropic", "Claude API", "Anthropic API key", "api", True, key_name="ANTHROPIC_API_KEY",
                install="https://console.anthropic.com/settings/keys",
                blurb="Fastest first word: streamed with prompt caching and adaptive effort."),
+    EngineSpec("gemini-api", "Gemini API", "Free key from Google AI Studio", "api", True, key_name="GEMINI_API_KEY",
+               install="https://aistudio.google.com/apikey",
+               blurb="Free with a Google account, no AI plan needed. Sees your screenshots."),
 )
 BY_ID = {spec.id: spec for spec in SPECS}
-PREFERENCE = ("claude-code", "anthropic", "codex", "gemini", "cursor")
+PREFERENCE = ("claude-code", "anthropic", "codex", "antigravity", "cursor", "gemini-api")
 
 
 # -- finding and probing ---------------------------------------------------------
@@ -135,7 +141,7 @@ def run_quick(argv: list[str], timeout: float = 6.0) -> RunResult:
 @dataclass
 class EngineStatus:
     spec: EngineSpec
-    status: str = "unknown"          # ready | not-installed | logged-out | missing-key | unknown
+    status: str = "unknown"          # ready | not-installed | logged-out | missing-key | unavailable | unknown
     path: str | None = None
     detail: str = ""
     version: str = ""
@@ -181,7 +187,7 @@ def probe(spec: EngineSpec, settings: Any, *, runner: Runner = run_quick,
                             detail="" if key else "Paste a key to use it.")
     path = which(spec.binaries)
     if not path:
-        return EngineStatus(spec, "not-installed", detail=f"Install it, then sign in. {spec.blurb}")
+        return EngineStatus(spec, "not-installed", detail=f"Not on this Mac yet: Connect installs it and signs you in. {spec.blurb}")
     status = EngineStatus(spec, "unknown", path=path)
     checker = _LOGIN_CHECKS.get(spec.id)
     if checker is not None:
@@ -210,11 +216,11 @@ def _check_claude(status: EngineStatus, runner: Runner, home: Path) -> None:
             return
         if data.get("loggedIn") is False:
             status.status = "logged-out"
-            status.detail = "Run claude auth login once to sign in with your Claude plan."
+            status.detail = "Connect opens your browser to sign in with your Claude plan."
             return
     if result.code != 0 and "unknown" not in (result.err + result.out).lower() and result.code != 127:
         status.status = "logged-out"
-        status.detail = "Run claude auth login once to sign in with your Claude plan."
+        status.detail = "Connect opens your browser to sign in with your Claude plan."
         return
     # Older Claude Code without `auth status`: credentials live in the keychain or this file.
     if (home / ".claude" / ".credentials.json").exists() or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
@@ -232,7 +238,7 @@ def _check_codex(status: EngineStatus, runner: Runner, home: Path) -> None:
             status.status = "ready"
     else:
         status.status = "logged-out"
-        status.detail = "Run codex login once and choose Sign in with ChatGPT."
+        status.detail = "Connect opens your browser to sign in with your ChatGPT plan."
 
 
 def _check_cursor(status: EngineStatus, runner: Runner, home: Path) -> None:
@@ -252,12 +258,12 @@ def _check_cursor(status: EngineStatus, runner: Runner, home: Path) -> None:
             return
         if signed is False:
             status.status = "logged-out"
-            status.detail = "Run agent login once to sign in with your Cursor account."
+            status.detail = "Connect opens your browser to sign in with your Cursor account."
             return
     lowered = text.lower()
     if "not logged in" in lowered or "not authenticated" in lowered or "login" in lowered and result.code != 0:
         status.status = "logged-out"
-        status.detail = "Run agent login once to sign in with your Cursor account."
+        status.detail = "Connect opens your browser to sign in with your Cursor account."
     elif result.code == 0 and ("logged in" in lowered or "@" in text):
         status.status = "ready"
         line = next((ln.strip(" ✓") for ln in text.splitlines() if "logged in" in ln.lower()), "")
@@ -266,18 +272,15 @@ def _check_cursor(status: EngineStatus, runner: Runner, home: Path) -> None:
         status.status = "ready"
 
 
-def _check_gemini(status: EngineStatus, runner: Runner, home: Path) -> None:
-    creds = home / ".gemini" / "oauth_creds.json"
-    if creds.exists() or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-        status.status = "ready"
-        status.detail = "Signed in with Google" if creds.exists() else "Using your Gemini API key"
+def _check_antigravity(status: EngineStatus, runner: Runner, home: Path) -> None:
+    if (home / ".gemini" / "jetski-standalone-oauth-token").exists():
+        status.status, status.detail = "ready", "Signed in to Antigravity"
     else:
-        status.status = "logged-out"
-        status.detail = "Run gemini once in Terminal and pick Login with Google."
+        status.status, status.detail = "logged-out", "Open Antigravity once and sign in with Google."
 
 
 _LOGIN_CHECKS = {"claude-code": _check_claude, "codex": _check_codex, "cursor": _check_cursor,
-                 "gemini": _check_gemini}
+                 "antigravity": _check_antigravity}
 
 
 class EngineRegistry:
@@ -299,10 +302,15 @@ class EngineRegistry:
             settings = self.settings()
             self._cache = [probe(spec, settings, runner=self.runner, which=self.which) for spec in SPECS]
             self._stamp = self.clock()
-        return list(self._cache)
+        return self._keys_now(self._cache)
 
     def cached(self) -> list[EngineStatus]:
-        return list(self._cache) if self._cache is not None else [EngineStatus(spec) for spec in SPECS]
+        return self._keys_now(self._cache) if self._cache is not None else [EngineStatus(spec) for spec in SPECS]
+
+    def _keys_now(self, statuses: list[EngineStatus]) -> list[EngineStatus]:
+        """Re-probe API engines (a free key check), so a just-pasted key counts."""
+        settings = self.settings()
+        return [probe(status.spec, settings) if status.spec.kind == "api" else status for status in statuses]
 
     def cards(self, selected: str = "", probe: bool = False) -> list[dict[str, Any]]:
         """Engine cards for Settings. Without ``probe`` this never spawns a process."""
@@ -320,7 +328,7 @@ def choose_engine(settings: Any, statuses: list[EngineStatus] | None = None,
     wanted = preferred or getattr(settings, "engine", "")
     if wanted:
         pick = by_id.get(wanted)
-        if pick is not None and pick.status not in {"not-installed", "missing-key"}:
+        if pick is not None and pick.status not in {"not-installed", "missing-key", "unavailable"}:
             return pick
     for engine_id in PREFERENCE:
         status = by_id.get(engine_id)
@@ -342,8 +350,14 @@ def make_engine_brain(status: EngineStatus, settings: Any):
                            model=getattr(settings, "model", "claude-opus-5-5"),
                            effort=getattr(settings, "effort", "low"),
                            max_tokens=getattr(settings, "max_tokens", 16000))
+    if spec.id == "gemini-api":
+        from mcp_vision.buddy.brain_gemini import GeminiKeyBrain
+
+        return GeminiKeyBrain(api_key=getattr(settings, "gemini_api_key", None) or os.environ.get(spec.key_name, ""),
+                              model=getattr(settings, "gemini_model", "") or "",
+                              effort=getattr(settings, "effort", "low"))
     brain_class = {"claude-code": ClaudeCodeBrain, "codex": CodexBrain, "cursor": CursorBrain,
-                   "gemini": GeminiBrain}[spec.id]
+                   "antigravity": AntigravityBrain}[spec.id]
     return brain_class(status.path or spec.binaries[0], model=getattr(settings, "cli_model", "") or "",
                        effort=getattr(settings, "effort", "low"))
 
@@ -427,6 +441,10 @@ class StreamParser:
             self.produced = True
         return texts
 
+    def refuse_tools(self) -> None:
+        """The CLI ran its own tool: stop reading, so nothing it read reaches a reply or an action."""
+        self.error, self.ended, self.produced, self.final = RAN_TOOLS, True, False, ""
+
     def handle(self, event: dict[str, Any]) -> list[str]:
         raise NotImplementedError
 
@@ -445,6 +463,7 @@ class CLIBrain:
     vision = True
     effort_map: dict[str, str] = {}
     last_usage: Usage | None = None     # what the last stream() used, as the CLI reported it
+    exit_timeout = 10.0                 # seconds for the CLI to exit after answering
 
     def __init__(self, binary: str, *, model: str = "", effort: str = "low", timeout: float = 120.0,
                  first_output_timeout: float = 45.0, spawn: Callable[..., Any] | None = None):
@@ -456,16 +475,19 @@ class CLIBrain:
         self._spawn = spawn or asyncio.create_subprocess_exec
 
     # subclasses fill these in
-    def invocation(self, *, system: str, turns: list[Turn], workdir: str, detailed: bool) -> Invocation:
+    def invocation(self, *, system: str, turns: list[Turn], workdir: str, detailed: bool,
+                   effort: str | None = None) -> Invocation:
         raise NotImplementedError
 
     def parser(self) -> StreamParser:
         raise NotImplementedError
 
-    def _effort(self, detailed: bool) -> str:
+    def _effort(self, detailed: bool, effort: str | None = None) -> str:
+        """Asked-for effort, else the user's (a step up for a walkthrough)."""
         from mcp_vision.buddy.brain_claude import _EFFORT_STEP
 
-        effort = _EFFORT_STEP.get(self.effort, self.effort) if detailed else self.effort
+        if not effort:
+            effort = _EFFORT_STEP.get(self.effort, self.effort) if detailed else self.effort
         return self.effort_map.get(effort, effort)
 
     async def warm(self) -> str:
@@ -488,14 +510,15 @@ class CLIBrain:
     def _ended(self, call: Invocation) -> None:
         """A call finished cleanly (subclasses get the next one ready)."""
 
-    async def stream(self, *, system: str, turns: list[Turn], detailed: bool = False) -> AsyncIterator[str]:
+    async def stream(self, *, system: str, turns: list[Turn], detailed: bool = False,
+                     effort: str | None = None) -> AsyncIterator[str]:
         workdir = tempfile.mkdtemp(prefix="plip-")
         process = None
         errors: asyncio.Future | None = None
         self.last_usage = None
         clean = False
         try:
-            call = self.invocation(system=system, turns=turns, workdir=workdir, detailed=detailed)
+            call = self.invocation(system=system, turns=turns, workdir=workdir, detailed=detailed, effort=effort)
             process, used = await self._start(call, workdir)
             if used != workdir:                      # a warm process: it already has its own folder
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -527,15 +550,23 @@ class CLIBrain:
                     break
             try:
                 # Once the answer's in, a CLI still flushing its own traffic isn't worth waiting for.
-                code = await asyncio.wait_for(process.wait(), 0.3 if parser.ended else None)
-                stderr = (await errors).decode("utf-8", "replace")
+                code = await asyncio.wait_for(process.wait(), 0.3 if parser.ended else self.exit_timeout)
             except asyncio.TimeoutError:
-                code, stderr = 0, ""                 # still going after its last event: the cleanup kills it
+                # answered but won't exit (stuck flush or child): don't hang
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                code = 0 if parser.produced or parser.final else -9
+            try:
+                stderr = (await asyncio.wait_for(asyncio.shield(errors), 2.0)).decode("utf-8", "replace")
+            except asyncio.TimeoutError:
+                stderr = ""                          # a child holds stderr open; cleanup cancels it
             self.last_usage = parser.usage
             if self.last_usage is not None and not self.last_usage.model:
                 self.last_usage.model = self.model or ""
             for text in parser.finish():
                 yield text
+            if parser.error == RAN_TOOLS:
+                raise EngineError(f"{self.label} {RAN_TOOLS}.")
             if parser.error and not parser.produced:
                 raise EngineError(f"{self.label}: {parser.error}")
             if code != 0 and not parser.produced:
@@ -574,8 +605,10 @@ def _discard(process: Any, folder: str) -> None:
 
 
 def _tail(text: str, limit: int = 240) -> str:
-    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    return " ".join(lines[-3:])[-limit:]
+    """The CLI's error line if it printed one, else its last lines (never stack frames)."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip() and not line.strip().startswith("at ")]
+    errors = [line for line in lines if "error" in line.lower() and not line.lower().startswith("warning")]
+    return " ".join(errors[:1] or lines[-3:])[-limit:]
 
 
 # Claude Code ----------------------------------------------------------------------------
@@ -620,7 +653,7 @@ class ClaudeCodeBrain(CLIBrain):
     label = "Claude"
     vision = True
 
-    def invocation(self, *, system, turns, workdir, detailed):
+    def invocation(self, *, system, turns, workdir, detailed, effort=None):
         *history, current = turns
         content = history_blocks(history)
         for shot in current.images:
@@ -632,7 +665,7 @@ class ClaudeCodeBrain(CLIBrain):
         # No tools, no MCP servers, no hooks/CLAUDE.md/plugins (--safe-mode), nothing saved to disk.
         argv = [self.binary, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
                 "--verbose", "--include-partial-messages", "--system-prompt", system, "--tools", "",
-                "--strict-mcp-config", "--safe-mode", "--no-session-persistence", "--effort", self._effort(detailed)]
+                "--strict-mcp-config", "--safe-mode", "--no-session-persistence", "--effort", self._effort(detailed, effort)]
         if self.model:
             argv += ["--model", self.model]
         # Each turn's screen and map are new, so only the system prompt and the history before them come back
@@ -647,22 +680,35 @@ class ClaudeCodeBrain(CLIBrain):
     def parser(self):
         return ClaudeCodeParser()
 
-    # Claude Code's command line doesn't depend on the question (it arrives on stdin), so the next
-    # process can start while Plip is idle: each turn then skips the CLI's start-up (~0.2 s).
+    # question comes on stdin, so a spare can start early (~0.3 s saved; ~100 MB, reaped when idle)
     # Only the long-running app turns this on; one-shot runs (plip ask, tests) would leave it waiting.
     prewarm = False
-    warm_ttl = 600.0                     # a warm process older than 10 minutes is started fresh
+    idle_ttl = 120.0
+    max_spares = 2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spares: dict[tuple, tuple[Any, str, float]] = {}   # command line -> (process, folder, born)
+        self._starting: set[tuple] = set()
 
     async def _start(self, call: Invocation, workdir: str) -> tuple[Any, str]:
-        warm, self._warm = getattr(self, "_warm", None), None
-        if warm is not None:
-            key, process, folder, born = warm
-            if key == self._key(call) and process.returncode is None and time.monotonic() - born < self.warm_ttl:
+        spare = self._spares.pop(self._key(call), None)
+        if spare is not None:
+            process, folder, born = spare
+            if process.returncode is None and time.monotonic() - born < self.idle_ttl:
                 return process, folder
-            _discard(process, folder)        # different flags (effort, model) or too old
+            _discard(process, folder)
         return await self._launch(call, workdir), workdir
 
     def _ended(self, call: Invocation) -> None:
+        self._spawn_spare(call)
+
+    def ensure_warm(self, system: str, effort: str | None = None) -> None:
+        """Start a spare for this prompt and effort ahead of the question (call on the loop)."""
+        call = self.invocation(system=system, turns=[Turn("user", "")], workdir="", detailed=False, effort=effort)
+        self._spawn_spare(call)
+
+    def _spawn_spare(self, call: Invocation) -> None:
         if not self.prewarm:
             return
         try:
@@ -671,29 +717,46 @@ class ClaudeCodeBrain(CLIBrain):
             pass
 
     async def _prewarm(self, call: Invocation) -> None:
-        if getattr(self, "_warm", None) is not None:
+        key, spares, pending = self._key(call), self._spares, self._starting
+        held = spares.get(key)
+        if key in pending or held is not None and held[0].returncode is None:
             return
+        pending.add(key)
         folder = tempfile.mkdtemp(prefix="plip-")
         try:
             process = await self._launch(call, folder)
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)
             return
-        if not self.prewarm:                 # closed while it was starting
+        finally:
+            pending.discard(key)
+        if not self.prewarm:                         # closed while it was starting
             _discard(process, folder)
             return
-        self._warm = (self._key(call), process, folder, time.monotonic())
+        while len(spares) >= self.max_spares:        # evict the oldest
+            _discard(*spares.pop(next(iter(spares)))[:2])
+        born = time.monotonic()
+        spares[key] = (process, folder, born)
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().call_later(self.idle_ttl, self._reap, key, born)
+
+    def _reap(self, key: tuple, born: float) -> None:
+        """Drop a spare nobody used in time (~100 MB)."""
+        spare = self._spares.get(key)
+        if spare is not None and spare[2] == born:
+            del self._spares[key]
+            _discard(spare[0], spare[1])
 
     @staticmethod
     def _key(call: Invocation) -> tuple:
         return tuple(call.argv), tuple(sorted(call.env.items()))
 
     def close(self) -> None:
-        """Drop the warm process (app quitting, brain switched)."""
+        """Drop the warm processes (app quitting, brain switched)."""
         self.prewarm = False
-        warm, self._warm = getattr(self, "_warm", None), None
-        if warm is not None:
-            _discard(warm[1], warm[2])
+        while self._spares:
+            process, folder, _ = self._spares.pop(next(iter(self._spares)))
+            _discard(process, folder)
 
     async def aclose(self) -> None:
         """Like close, after letting a process that's still starting finish, so nothing is left waiting."""
@@ -714,8 +777,11 @@ class CodexParser(StreamParser):
 
     def handle(self, event):
         kind = event.get("type", "")
+        item = event.get("item") or {}
+        if kind in {"item.started", "item.updated", "item.completed"} and item.get("type") in _CODEX_TOOLS:
+            self.refuse_tools()                      # even its sandbox's shell can read your files
+            return []
         if kind in {"item.updated", "item.completed"}:
-            item = event.get("item") or {}
             if item.get("type") in {"agent_message", "assistant_message"}:
                 text = item.get("text") or ""
                 key = str(item.get("id", ""))
@@ -736,17 +802,20 @@ class CodexParser(StreamParser):
         return []
 
 
+_CODEX_TOOLS = {"command_execution", "file_change", "mcp_tool_call", "web_search", "patch_apply"}
+
+
 class CodexBrain(CLIBrain):
     name = "codex"
     label = "ChatGPT"
     vision = True
     effort_map = {"xhigh": "high", "max": "high"}
 
-    def invocation(self, *, system, turns, workdir, detailed):
+    def invocation(self, *, system, turns, workdir, detailed, effort=None):
         images = write_images(turns[-1], workdir)
         prompt = transcript_prompt(turns, images, system=system)
         argv = [self.binary, "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral",
-                "--color", "never", "-c", f"model_reasoning_effort={json.dumps(self._effort(detailed))}"]
+                "--color", "never", "-c", f"model_reasoning_effort={json.dumps(self._effort(detailed, effort))}"]
         if self.model:
             argv += ["--model", self.model]
         for path in images:
@@ -767,6 +836,9 @@ class CursorParser(StreamParser):
 
     def handle(self, event):
         kind = event.get("type")
+        if kind == "tool_call":
+            self.refuse_tools()
+            return []
         if kind == "assistant":
             if "timestamp_ms" not in event or "model_call_id" in event:
                 return []
@@ -787,7 +859,7 @@ class CursorBrain(CLIBrain):
     label = "Cursor"
     vision = False
 
-    def invocation(self, *, system, turns, workdir, detailed):
+    def invocation(self, *, system, turns, workdir, detailed, effort=None):
         prompt = transcript_prompt(turns, system=system)
         argv = [self.binary, "-p", "--output-format", "stream-json", "--stream-partial-output",
                 "--mode", "ask", "--trust", "--workspace", workdir]
@@ -800,47 +872,58 @@ class CursorBrain(CLIBrain):
         return CursorParser()
 
 
-# Gemini ----------------------------------------------------------------------------------
+# Antigravity -----------------------------------------------------------------------------
 
-class GeminiParser(StreamParser):
+class AntigravityParser(StreamParser):
+    """agy's stream-json: step_update events with text deltas, a "tool" step for any tool, then a result."""
+
     def handle(self, event):
-        kind = event.get("type")
-        if kind == "message" and event.get("role") == "assistant":
-            return [str(event.get("content") or "")]
-        if kind == "error" and event.get("severity", "error") == "error":
+        kind = event.get("event")
+        if kind == "step_update":
+            step = event.get("step_update") or {}
+            if step.get("step_type") == "tool":
+                self.refuse_tools()                       # headless denies most; we stop on any
+                return []
+            if step.get("step_type") == "agent_response":
+                return [str(step.get("text_delta") or "")]
+        if kind == "result":
+            result = event.get("result") or {}
+            if result.get("status") != "SUCCESS":
+                self.error = str(result.get("error") or result.get("status") or "failed")
+            elif not self.final:
+                self.final = str(result.get("response") or "").strip()
+            usage = result.get("usage") or {}
+            self.usage = from_report({"input_tokens": usage.get("input_tokens", 0) - usage.get("cache_read_tokens", 0),
+                                      "output_tokens": usage.get("output_tokens", 0),
+                                      "cache_read_input_tokens": usage.get("cache_read_tokens", 0)},
+                                     model=self.model)
+            self.ended = True
+        if kind == "error":
             self.error = str(event.get("message") or event.get("error") or "error")
-        if kind == "result" and event.get("status") not in {None, "success"}:
-            error = event.get("error") or {}
-            self.error = str(error.get("message") if isinstance(error, dict) else error or "failed")
-        if kind == "result" and isinstance(event.get("stats"), dict):
-            stats = event["stats"]
-            models = stats.get("models") if isinstance(stats.get("models"), dict) else {}
-            self.usage = from_report(stats, model=next(iter(models), ""), cached_in_input=True)
         return []
 
 
-class GeminiBrain(CLIBrain):
-    name = "gemini"
-    label = "Gemini"
-    vision = True
+class AntigravityBrain(CLIBrain):
+    """Gemini on a Google AI plan via Antigravity's CLI (agy -p). Sandbox on, tools refused, text only."""
 
-    def invocation(self, *, system, turns, workdir, detailed):
-        images = write_images(turns[-1], workdir)
-        system_file = os.path.join(workdir, "plip-system.md")
-        with open(system_file, "w", encoding="utf-8") as handle:
-            handle.write(system)
-        prompt = transcript_prompt(turns)
-        refs = " ".join(f"@{os.path.basename(path)}" for path in images)
-        argv = [self.binary, "--output-format", "stream-json", "--skip-trust", "--approval-mode", "default"]
-        if self.model:
-            argv += ["--model", self.model]
-        argv += ["--prompt", (refs + "\n\n" + prompt) if refs else prompt]
-        return Invocation(argv, env={"GEMINI_SYSTEM_MD": system_file})
+    name = "antigravity"
+    label = "Gemini"
+    vision = False
+    levels = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
+
+    def invocation(self, *, system, turns, workdir, detailed, effort=None):
+        model = self.model or f"gemini-3.8-flash-{self.levels.get(self._effort(detailed, effort), 'medium')}"
+        self._model = model
+        argv = [self.binary, "-p", transcript_prompt(turns, system=system), "--output-format", "stream-json",
+                "--sandbox", "--model", model]
+        return Invocation(argv)
 
     def parser(self):
-        return GeminiParser()
+        parser = AntigravityParser()
+        parser.model = getattr(self, "_model", "") or self.model
+        return parser
 
 
-__all__ = ["BY_ID", "SPECS", "ClaudeCodeBrain", "CodexBrain", "CursorBrain", "EngineError", "EngineRegistry",
-           "EngineSpec", "EngineStatus", "GeminiBrain", "choose_engine", "find_binary", "make_engine_brain", "probe",
+__all__ = ["BY_ID", "SPECS", "AntigravityBrain", "ClaudeCodeBrain", "CodexBrain", "CursorBrain", "EngineError", "EngineRegistry",
+           "EngineSpec", "EngineStatus", "choose_engine", "find_binary", "make_engine_brain", "probe",
            "transcript_prompt"]

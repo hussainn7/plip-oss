@@ -18,25 +18,49 @@ class Presenter:
 
     def __init__(self, post_island: Callable[[list[Message]], None],
                  set_mood: Callable[[str, float], None] | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, on_live: Callable[[], None] = lambda: None,
+                 sound: Callable[[str], None] | None = None):
         self.post_island = post_island
         self.set_mood = set_mood or (lambda mood, level: None)
         self.clock = clock
+        self.on_live = on_live                            # phase changed (the tour's "try it" step watches)
+        self.sound = sound or (lambda name: None)
+        self.live: dict[str, Any] = {"phase": "idle", "transcript": "", "answer": "", "error": "", "at": 0.0}
         self._last_level = 0.0
         self.phase = "idle"
         self.walkthrough: dict[str, Any] | None = None
         self.plan: list[str] = []
+        self.goal: dict[str, Any] | None = None       # goal chip, kept across check-ins
 
     def _island(self, **state: Any) -> None:
         self.post_island([{"type": "island", "state": state}])
+
+    def _live(self, **changes: Any) -> None:
+        """Request phase for Settings (phase changes only, not every word)."""
+        self.live.update(changes, at=time.time())
+        try:
+            self.on_live()
+        except Exception:
+            pass
 
     # -- push-to-talk ------------------------------------------------------------
     def listening(self) -> None:
         self.phase = "listening"
         self.walkthrough = None
         self.plan = []
+        self.goal = None
         self.post_island([{"type": "reset"}, {"type": "island", "state": {"phase": "listening"}}])
         self.set_mood("listening", 0.0)
+        self._live(phase="listening", transcript="", answer="", error="")
+
+    def asked(self, text: str) -> None:
+        """A button's request (Yes, Keep going), shown as if spoken."""
+        self.phase = "thinking"
+        self.walkthrough = None
+        self.plan = []
+        self.goal = None
+        self.post_island([{"type": "reset"}, {"type": "island", "state": {"phase": "thinking", "transcript": text}}])
+        self.set_mood("thinking", 0.0)
 
     def level(self, value: float) -> None:
         now = self.clock()
@@ -50,21 +74,26 @@ class Presenter:
 
     def transcript(self, text: str) -> None:
         self._island(transcript=text)
+        self.live["transcript"] = text
 
     def thinking(self) -> None:
         self.phase = "thinking"
         self._island(phase="thinking", level=0)
         self.set_mood("thinking", 0.0)
+        self._live(phase="thinking")
 
     def idle(self) -> None:
         self.phase = "idle"
-        self._island(phase="idle", level=0)
+        self._island(phase="idle", level=0, speaking=False)
         self.set_mood("idle", 0.0)
 
-    def failed(self, message: str) -> None:
+    def failed(self, message: str, setup: bool | None = None) -> None:
+        """``setup``: the fix is in settings (default: the message says so)."""
         self.phase = "error"
-        self._island(phase="error", error=message)
+        fixable = "settings" in message.lower() if setup is None else setup
+        self._island(phase="error", error=message, fixable=fixable)
         self.set_mood("error", 0.0)
+        self._live(phase="error", error=message)
 
     # -- companion observer ------------------------------------------------------------
     def __call__(self, kind: str, data: dict[str, Any]) -> None:
@@ -76,18 +105,24 @@ class Presenter:
         phase = data.get("phase")
         if phase == "thinking":
             self.phase = "thinking"
-            state: dict[str, Any] = {"phase": "thinking", "done": False, "level": 0}
+            state: dict[str, Any] = {"phase": "thinking", "done": False, "level": 0, "finished": None}
             if data.get("guide"):
-                # A walkthrough check-in: fresh step text, keep progress.
+                # check-in or next task step: fresh step text, keep progress
                 state.update(answer="", steps=[], walkthrough=self.walkthrough)
+                if self.goal is not None:
+                    self._island(**state)
+                    self.post_island([{"type": "step", "step": dict(self.goal)}])
+                    self.set_mood("thinking", 0.0)
+                    return
             elif data.get("transcript"):
                 state["transcript"] = data["transcript"]
             self._island(**state)
             self.set_mood("thinking", 0.0)
         elif phase == "answering":
             self.phase = "answering"
-            self._island(phase="answering", done=False)
+            self._island(phase="answering", done=False, speaking=True, offer=None, finished=None)
             self.set_mood("speaking", 0.5)
+            self._live(phase="answering")
 
     def _on_step(self, data: dict[str, Any]) -> None:
         step = {key: data[key] for key in ("id", "label", "status", "detail") if data.get(key)}
@@ -98,6 +133,7 @@ class Presenter:
 
     def _on_answer(self, data: dict[str, Any]) -> None:
         self.post_island([{"type": "append", "field": "answer", "text": data.get("text", "")}])
+        self.live["answer"] = (self.live["answer"] + data.get("text", ""))[:400]
 
     def _on_walkthrough(self, data: dict[str, Any]) -> None:
         self.walkthrough = {"index": int(data.get("index", 0)), "total": int(data.get("total", 1)),
@@ -109,7 +145,7 @@ class Presenter:
         if data.get("waiting"):
             messages.append({"type": "step", "step": {"id": "wait", "label": "Your turn. I'm watching", "status": "active"}})
         elif data.get("timed_out"):
-            messages.append({"type": "step", "step": {"id": "wait", "label": "Paused. Ask me to continue", "status": "skipped"}})
+            messages.append({"type": "step", "step": {"id": "wait", "label": "Paused till you’re ready", "status": "skipped"}})
         elif data.get("finished"):
             messages.append({"type": "step", "step": {"id": "wait", "label": "All done", "status": "done"}})
             self.set_mood("happy", 0.0)
@@ -118,7 +154,35 @@ class Presenter:
     def _on_done(self, data: dict[str, Any]) -> None:
         latency = data.get("latency_ms")
         self._island(done=True, latencyMs=round(latency) if isinstance(latency, (int, float)) else None)
-        self.set_mood("happy" if not self.walkthrough else "idle", 0.0)
+        working = self.walkthrough or (self.goal is not None and self.goal["status"] == "active")
+        self.set_mood("happy" if not working else "idle", 0.0)
+        self._live(phase="done")
+
+    def _on_offer(self, data: dict[str, Any]) -> None:
+        """Ended on a yes/no suggestion: the island shows buttons."""
+        self._island(offer=str(data.get("text") or "")[:160] or None)
+
+    def _on_quiet(self, _data: dict[str, Any]) -> None:
+        """Plip stopped talking: a finished answer may tuck away now."""
+        self._island(speaking=False)
+
+    def _on_goal(self, data: dict[str, Any]) -> None:
+        """Multi-step task: one chip with the goal and current step."""
+        text = str(data.get("text") or "")[:80]
+        if not text:
+            return
+        status = "done" if data.get("done") else "skipped" if data.get("paused") else "active"
+        detail = "paused" if data.get("paused") else f"step {data['step']}" if data.get("step") else ""
+        self.goal = {"id": "goal", "label": f"Goal: {text}", "status": status, **({"detail": detail} if detail else {})}
+        self.post_island([{"type": "step", "step": dict(self.goal)}])
+
+    def _on_finished(self, data: dict[str, Any]) -> None:
+        # once per request, after the voice; plain answers stay quiet
+        outcome = data.get("outcome")
+        if outcome == "done":
+            self.sound("done")
+        if outcome in {"done", "bye"}:
+            self._island(finished=outcome)            # island: "Done", then tucks away sooner
 
     def _on_error(self, data: dict[str, Any]) -> None:
         self.failed(data.get("message") or "Something went wrong.")

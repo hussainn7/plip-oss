@@ -6,6 +6,8 @@ tested on any OS.
 """
 from __future__ import annotations
 
+import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -13,14 +15,32 @@ from pathlib import Path
 from typing import Any
 
 from mcp_vision import __version__
+from mcp_vision.buddy.hotkey import CHORDS, chord, keyboard_owner
 from mcp_vision.buddy.store import History, Prefs, config_dir
 
-KEY_NAMES = {"ANTHROPIC_API_KEY", "TYPESAFE_API_KEY", "ELEVENLABS_API_KEY", "ASSEMBLYAI_API_KEY"}
+KEY_NAMES = {"ANTHROPIC_API_KEY", "GEMINI_API_KEY", "TYPESAFE_API_KEY", "ELEVENLABS_API_KEY", "ASSEMBLYAI_API_KEY"}
 DEPTHS = {"fast", "balanced", "deep"}
+TOUR_STEPS = ("welcome", "permissions", "brain", "try", "done")
+ASK_AFTER_TASKS = (1, 3)      # the finished tasks after which Plip asks for Google (plus once when an update is out)
+MAX_ASKS = 3                  # Laters before Plip stops asking (the Account tab still offers it)
+
+
+def _in_background(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, daemon=True, name="plip-settings-work").start()
 IMPORT_SOURCES = {"contacts", "autofill", "mail"}
 AI_SOURCES = {"chatgpt", "claude", "gemini", "ai"}
-CLAUDE_INSTALL_AND_LOGIN = ("curl -fsSL https://claude.ai/install.sh | bash && "
-                            "\"$HOME/.local/bin/claude\" auth login")
+# pasted key shapes: Google AI Studio, Anthropic
+KEY_SHAPES = (("GEMINI_API_KEY", re.compile(r"AQ\.[0-9A-Za-z_\-.]{20,400}|AIza[0-9A-Za-z_\-]{30,60}")),   # AQ. = new
+              ("ANTHROPIC_API_KEY", re.compile(r"sk-ant-[0-9A-Za-z_\-]{20,200}")))
+
+
+def _check_key(name: str, value: str) -> str:
+    """"" if the provider takes the key, else the problem. Only Google's is checked."""
+    if name != "GEMINI_API_KEY":
+        return ""
+    from mcp_vision.buddy.brain_gemini import check_key
+
+    return check_key(value)
 
 
 @dataclass
@@ -34,6 +54,7 @@ class Platform:
     quit: Callable[[], None] = lambda: None
     open_settings: Callable[[str], None] = lambda tab: None
     restart: Callable[[], None] = lambda: None             # quit and open Plip again
+    clipboard: Callable[[], str] = lambda: ""                # read only on Paste key
 
 
 @dataclass
@@ -52,11 +73,21 @@ class SettingsService:
     action_log: Any = None                                 # buddy.actions.ActionLog (for stats)
     usage: Any = None                                      # buddy.usage.UsageLog (the Usage tab)
     parakeet: Any = None                                   # buddy.parakeet.ParakeetModel (the opt-in download)
-    account: Any = None                                    # buddy.account.Account (sign in before Plip works)
+    account: Any = None                                    # buddy.account.Account (a guest first, Google later)
+    background: Callable[[Callable[[], None]], None] = _in_background   # network work, off the UI thread
+    on_ask: Callable[[str], None] = lambda moment: None    # a moment to ask for Google: the app shows it, when idle
     updates: Any = None                                    # buddy.updates.Updates (a newer Plip is out)
     check_updates: Callable[[], None] = lambda: None       # ask GitHub now, in the background
+    connector: Any = None                                  # buddy.connect.Connector (one-click Connect)
+    live: Callable[[], dict | None] = lambda: None         # last request, live (tour's "try it" step)
+    check_key: Callable[[str, str], str] = _check_key      # "" when the provider takes a pasted key
+    key_check: dict = field(default_factory=dict)          # {name, state: checking | ok | bad, message}
+    main: Callable[[Callable[[], None]], None] = lambda job: job()       # run on the UI thread
+    background: Callable[[Callable[[], None]], None] = lambda job: threading.Thread(target=job, daemon=True).start()
     connect_note: str = ""                                 # what "Connect AI" just did, shown under the button
     report_note: str = ""                                  # "sent" | "failed" after a bug report or feature request
+    hotkey_works: Callable[[], bool] = lambda: True        # macOS passes Plip the keys (see hotkey.can_listen)
+    apply_hotkey: Callable[[str], None] = lambda name: None   # switch the talk shortcut now
 
     @property
     def prefs(self) -> Prefs:
@@ -66,6 +97,10 @@ class SettingsService:
         prefs = self.prefs
         settings = self.settings()
         engines = self.engines()
+        if self.connector is not None:                 # live install / sign-in progress on its card
+            progress = self.connector.snapshot()
+            engines = [{**engine, "connect": progress[engine["id"]]} if engine["id"] in progress else engine
+                       for engine in engines]
         perms = self.platform.permissions() or {}
         keys = {name: bool(_key(settings, name)) for name in KEY_NAMES}
         tts = prefs.tts or ("elevenlabs" if settings.tts in {"auto", "elevenlabs"} and keys["ELEVENLABS_API_KEY"]
@@ -77,6 +112,7 @@ class SettingsService:
             "engines": engines,
             "depth": prefs.depth if prefs.depth in DEPTHS else "balanced",
             "walkthroughs": prefs.walkthroughs,
+            "sounds": prefs.sounds,
             "permissions": {"screen": perms.get("screenRecording"), "accessibility": perms.get("accessibility"),
                             "microphone": perms.get("microphone"), "speech": perms.get("speechRecognition"),
                             "restart": bool(perms.get("restart")), "guiding": str(perms.get("guiding") or "")},
@@ -91,12 +127,17 @@ class SettingsService:
             "stats": self._stats(),
             "usage": self._usage(),
             "onboarded": prefs.onboarded,
+            "tour": {"step": prefs.tour_step if prefs.tour_step in TOUR_STEPS else "welcome"},
+            "live": self.live(),
             "connect": self.connect_note,
+            "keyCheck": dict(self.key_check) or None,
             "report": self.report_note,
             "account": self.account.snapshot() if self.account is not None
-            else {"available": False, "required": False},
+            else {"available": False, "identified": False, "anonymous": False, "prompt": False},
             "update": self.updates.snapshot() if self.updates is not None
             else {"enabled": prefs.update_check, "current": __version__, "available": None},
+            "hotkey": {**chord(prefs.hotkey).card(), "works": bool(self.hotkey_works()), "owner": keyboard_owner(),
+                       "choices": [chord(name).card() for name in CHORDS]},
         }
 
     def _stats(self) -> dict:
@@ -114,7 +155,9 @@ class SettingsService:
         return summary(self.usage.rows())
 
     def push(self) -> None:
-        self.post([{"type": "settings", "state": self.snapshot()}])
+        snapshot = self.snapshot()
+        self._funnel(snapshot, self.prefs)
+        self.post([{"type": "settings", "state": snapshot}])
 
     def handle(self, command: dict[str, Any]) -> None:
         name = command.get("cmd", "")
@@ -134,6 +177,51 @@ class SettingsService:
         name, value = str(command.get("name", "")), str(command.get("value", "")).strip()
         if name not in KEY_NAMES or not value or "\n" in value:
             return
+        if name == "GEMINI_API_KEY":                    # check with Google before saving
+            self._check_then_save(name, value)
+            return
+        self._save_key(name, value)
+
+    def _cmd_paste_key(self, _command):
+        """"Paste key": take an AI key off the clipboard; nothing else is kept."""
+        text = (self.platform.clipboard() or "").strip()
+        for name, shape in KEY_SHAPES:
+            if shape.fullmatch(text):
+                self._cmd_set_key({"name": name, "value": text})
+                return
+        self.key_check = {"name": "", "state": "bad", "message": "There's no key on your clipboard yet. On Google's "
+                          "page, click Copy next to your key, then click Paste key again."}
+        self.push()
+
+    def _check_then_save(self, name: str, value: str) -> None:
+        self.key_check = {"name": name, "state": "checking", "message": "Checking the key with Google…"}
+        self.push()
+
+        def check() -> None:
+            problem = self.check_key(name, value)
+
+            def done() -> None:
+                self.key_check = {"name": name, "state": "bad" if problem else "ok", "message": problem}
+                if problem:
+                    self.push()
+                    return
+                from mcp_vision.buddy.cli import write_env
+
+                write_env(self.env_path or config_dir() / ".env", {name: value})
+                if not self._ready_engine():
+                    self._update_prefs(engine="gemini-api")     # only working brain: select it (one rebuild)
+                else:
+                    self.reload()
+                    self.push()
+            self.main(done)
+        self.background(check)
+
+    def _ready_engine(self) -> str:
+        """A brain that already works (other than the one being added), or ""."""
+        return next((engine["id"] for engine in self.engines() if engine.get("status") == "ready"
+                     and engine.get("id") != "gemini-api"), "")
+
+    def _save_key(self, name: str, value: str) -> None:
         from mcp_vision.buddy.cli import write_env
 
         write_env(self.env_path or config_dir() / ".env", {name: value})
@@ -157,8 +245,24 @@ class SettingsService:
         if command.get("depth") in DEPTHS:
             self._update_prefs(depth=command["depth"])
 
+    def _cmd_set_hotkey(self, command):
+        name = str(command.get("id", ""))
+        if name not in CHORDS:
+            return
+        prefs = self.prefs
+        prefs.hotkey = name
+        prefs.save(self.prefs_path)
+        self.apply_hotkey(name)                    # no brain rebuild needed
+        self.push()
+
     def _cmd_set_walkthroughs(self, command):
         self._update_prefs(walkthroughs=bool(command.get("enabled")))
+
+    def _cmd_set_sounds(self, command):
+        prefs = self.prefs
+        prefs.sounds = bool(command.get("enabled"))
+        prefs.save(self.prefs_path)                    # read on every sound: no brain rebuild
+        self.push()
 
     def _cmd_set_voice(self, command):
         changes = {}
@@ -190,16 +294,35 @@ class SettingsService:
         else:
             self.push()
 
-    def _cmd_finish_onboarding(self, _command):
+    def _cmd_finish_onboarding(self, command):
+        """Start using Plip, or Skip setup: either way they get an account (a guest, like Quiet Nomad) right now."""
+        self._milestone("onboarding:" + ("skipped" if command.get("skipped") else "done"), "onboarding_step",
+                        step="skipped" if command.get("skipped") else "done")
         self._save_onboarded(True)
+        if self.account is not None and self.account.available and not self.account.user:
+            def make() -> None:
+                self.account.ensure_anonymous()        # its on_change pushes the new name to Settings
+            self.background(make)
 
     def _cmd_tour_start(self, _command):
         """General → Replay the welcome tour: the walkthrough again, everything set up stays."""
-        self._save_onboarded(False)
+        self._save_onboarded(False, step="welcome")
 
-    def _save_onboarded(self, done: bool) -> None:
+    def _cmd_tour_go(self, command):
+        """Tour step changed: saved, so a restart resumes there (and the funnel's first events)."""
+        step = str(command.get("step") or "")
+        if step in TOUR_STEPS:
+            prefs = self.prefs
+            prefs.tour_step = step
+            prefs.save(self.prefs_path)
+            self._milestone("onboarding:" + step, "onboarding_step", step=step)
+            self.push()
+
+    def _save_onboarded(self, done: bool, step: str | None = None) -> None:
         prefs = self.prefs
         prefs.onboarded = done
+        if step is not None:
+            prefs.tour_step = step
         prefs.save(self.prefs_path)
         self.push()
 
@@ -220,8 +343,90 @@ class SettingsService:
 
     def _cmd_account_sign_out(self, _command):
         if self.account is not None:
-            self.account.sign_out()                    # its on_change stops Plip until they sign in again
+            self.account.sign_out()                    # Plip keeps working; a new guest account follows
             self.push()
+
+    def _cmd_account_later(self, _command):
+        if self.account is None or not self.account.prompt:
+            return
+        prefs = self.prefs
+        prefs.signin_asks += 1
+        prefs.save(self.prefs_path)
+        self.account.later()
+        self._track("signin_skipped", asks=prefs.signin_asks, tasks=prefs.tasks_done)
+        self.push()
+
+    # -- the setup funnel: each step once per install, with the account along (analytics.track) ---------
+    def _milestone(self, key: str, event: str, prefs: Prefs | None = None, **properties) -> bool:
+        """Send ``event`` the first time ``key`` is reached on this install. True when it was new."""
+        prefs = prefs or self.prefs
+        if key in prefs.milestones:
+            return False
+        prefs.milestones.append(key)
+        prefs.save(self.prefs_path)
+        self._track(event, **properties)
+        return True
+
+    def _track(self, event: str, **properties) -> None:
+        from mcp_vision.analytics import track
+
+        account = self.account.distinct_id if self.account is not None else ""
+        track(event, {**properties, "account": account})
+
+    def _funnel(self, snapshot: dict[str, Any], prefs: Prefs) -> None:
+        """What the snapshot shows reached: permissions on, the chosen AI ready."""
+        for name in ("screen", "accessibility", "microphone"):
+            if snapshot["permissions"].get(name) is True:
+                self._milestone(f"permission:{name}", "permission_granted", prefs, permission=name)
+        engine = next((item for item in snapshot["engines"] if item.get("selected")), None)
+        if engine and engine.get("status") == "ready":
+            self._milestone("engine", "engine_connected", prefs, engine=str(engine.get("id", "")))
+
+    # -- the moments Plip asks for Google: never before the first finished task --------------------------
+    def task_done(self) -> None:
+        """A task finished (the app calls this): count it, and on the 1st and 3rd ask for Google."""
+        prefs = self.prefs
+        prefs.tasks_done += 1
+        prefs.save(self.prefs_path)
+        if prefs.tasks_done == 1:
+            self._milestone("first_task", "first_task_done", prefs)
+        if prefs.tasks_done in ASK_AFTER_TASKS:
+            self.ask_sign_in("first_task" if prefs.tasks_done == 1 else "third_task")
+
+    def update_found(self) -> None:
+        """A newer Plip is out (the app calls this): the one update moment to ask for Google."""
+        prefs = self.prefs
+        if prefs.asked_on_update:
+            self.push()
+            return
+        if self.ask_sign_in("update"):              # the moment is spent only when it was used
+            prefs.asked_on_update = True
+            prefs.save(self.prefs_path)
+        else:
+            self.push()
+
+    def ask_sign_in(self, moment: str) -> bool:
+        """Put the Google card up on Home, if they're a guest and haven't said Later three times.
+
+        A card still up from an earlier moment (they closed the window instead of tapping Later) is asked
+        again: only Later counts as an answer. How it's shown is the app's call (``on_ask``): a notch notice
+        after the first task, Settings when they're idle after that.
+        """
+        account = self.account
+        if account is None or not account.anonymous or account.status == "waiting":
+            return False
+        if self.prefs.signin_asks >= MAX_ASKS:
+            return False
+        account.ask()
+        self._track("signin_prompted", moment=moment, tasks=self.prefs.tasks_done)
+        self.push()
+        self.on_ask(moment)
+        return True
+
+    def signed_in(self) -> None:
+        """Google linked (the app calls this from the account's on_signed_in)."""
+        self._track("signin_done", tasks=self.prefs.tasks_done)
+        self.push()
 
     # -- a newer Plip: download it, or stop asking ----------------------------------------------
     def _cmd_update_download(self, _command):
@@ -239,25 +444,38 @@ class SettingsService:
         self.push()
 
     def _cmd_quick_connect(self, _command):
-        """One button: use a ready AI, else sign in to an installed one, else install Claude and sign in."""
+        """One button: use a ready AI, else sign in to an installed one; with none, point to the cards."""
         engines = self.engines()
-        subs = [engine for engine in engines if engine.get("kind") == "subscription"]
         ready = next((engine for engine in engines if engine.get("status") == "ready"), None)
-        logged_out = next((engine for engine in subs if engine.get("login")), None)
         if ready:
             self.connect_note = f"Connected to {ready['label']}."
             self._update_prefs(engine=ready["id"])
             return
-        if logged_out:
-            self.connect_note = (f"A Terminal window opened to sign in to {logged_out['label']}. "
-                                 "Finish there, then come back.")
-            self.platform.run_in_terminal(logged_out["login"])
+        signed_out = next((engine for engine in engines if engine.get("kind") == "subscription"
+                           and engine.get("status") in {"logged-out", "unknown"} and engine.get("id") != "antigravity"), None)
+        if signed_out and self.connector is not None:
+            self.connect_note = ""
+            self.connector.start(signed_out["id"])
         else:
-            self.connect_note = ("A Terminal window opened to install Claude and sign in with your Claude plan. "
-                                 "Finish there, then come back.")
-            self.platform.run_in_terminal(CLAUDE_INSTALL_AND_LOGIN)
+            self.connect_note = "Pick the AI you use below, or get a free one from Google."
         self.push()
-        self.on_refresh()
+
+    def _cmd_engine_connect(self, command):
+        """One click: install if missing, sign in via the browser, switch to it."""
+        if self.connector is not None:
+            self.connector.start(str(command.get("id", "")))
+            self.push()
+            return
+        self._cmd_engine_login(command)
+
+    def _cmd_engine_connect_cancel(self, command):
+        if self.connector is not None:
+            self.connector.cancel(str(command.get("id", "")))
+            self.push()
+
+    def _cmd_engine_connect_code(self, command):
+        if self.connector is not None and isinstance(command.get("code"), str):
+            self.connector.send_code(str(command.get("id", "")), command["code"][:500])
 
     # -- General → Support: a bug report or a feature request, only what they typed ------------------
     def _cmd_report_issue(self, command):
@@ -284,6 +502,9 @@ class SettingsService:
         self.push()
 
     def _cmd_engine_login(self, command):
+        if self.connector is not None:               # browser sign-in, not Terminal
+            self._cmd_engine_connect(command)
+            return
         engine = next((item for item in self.engines() if item["id"] == command.get("id")), None)
         if engine and engine.get("login"):
             self.platform.run_in_terminal(engine["login"])
@@ -307,7 +528,8 @@ class SettingsService:
         self.platform.restart()
 
     def _cmd_test_voice(self, _command):
-        self.platform.say("Hey, I'm Plip. Hold control and option, and ask me anything.")
+        talk = chord(self.prefs.hotkey).label.lower().replace(" + ", " and ")
+        self.platform.say(f"Hey, I'm Plip. Hold {talk}, and ask me anything.")
 
     def _cmd_clear_usage(self, _command):
         if self.usage is not None:
@@ -372,7 +594,8 @@ class SettingsService:
 def _key(settings: Any, name: str) -> str | None:
     import os
 
-    attribute = {"ANTHROPIC_API_KEY": "anthropic_api_key", "TYPESAFE_API_KEY": "typesafe_api_key",
+    attribute = {"ANTHROPIC_API_KEY": "anthropic_api_key", "GEMINI_API_KEY": "gemini_api_key",
+                 "TYPESAFE_API_KEY": "typesafe_api_key",
                  "ELEVENLABS_API_KEY": "elevenlabs_api_key", "ASSEMBLYAI_API_KEY": "assemblyai_api_key"}.get(name)
     value = getattr(settings, attribute, None) if attribute else None
     return value or os.environ.get(name)

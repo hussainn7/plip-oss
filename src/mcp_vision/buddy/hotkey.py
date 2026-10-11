@@ -1,17 +1,14 @@
-"""Hold Control+Option to talk.
+"""Hold Control+Option (or the Settings shortcut) to talk; a regular key during the chord cancels.
 
-``ChordDetector`` is the platform-neutral rule (tested on any OS); the macOS
-listener feeds it from a listen-only Quartz event tap, falling back to
-NSEvent global monitors when the tap cannot be created.
-
-Like Clicky, it is a modifier-only chord: pressing both Control and Option
-starts listening, releasing either stops. If a regular key is pressed while
-the chord is held (Control+Option+Arrow in some app), it was a different
-shortcut, so the recording is cancelled instead of submitted.
+``ChordDetector`` is the OS-neutral rule; macOS feeds it from a Quartz tap (NSEvent monitors as fallback).
+Keys only arrive with Accessibility / Input Monitoring: Plip's, or the launching terminal's.
 """
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 
 # Quartz / NSEvent modifier masks (identical values in both APIs).
 CONTROL = 1 << 18
@@ -19,19 +16,88 @@ OPTION = 1 << 19
 SHIFT = 1 << 17
 COMMAND = 1 << 20
 
+# In the order macOS writes them: ⌃⌥⇧⌘.
+_KEYS = ((CONTROL, "control", "⌃", "Control"), (OPTION, "option", "⌥", "Option"),
+         (SHIFT, "shift", "⇧", "Shift"), (COMMAND, "command", "⌘", "Command"))
+CHORDS = ("control+option", "option+command", "control+shift", "control+command")   # what Settings offers
+DEFAULT_CHORD = CHORDS[0]
+
+
+@dataclass(frozen=True)
+class Chord:
+    id: str
+    mask: int
+
+    @property
+    def keys(self) -> list[str]:
+        return [symbol for bit, _, symbol, _ in _KEYS if self.mask & bit]
+
+    @property
+    def symbols(self) -> str:
+        return "".join(self.keys)
+
+    @property
+    def label(self) -> str:
+        return " + ".join(word for bit, _, _, word in _KEYS if self.mask & bit)
+
+    def card(self) -> dict:
+        return {"id": self.id, "keys": self.keys, "label": self.label}
+
+
+def chord(name: str | None) -> Chord:
+    """One of the shortcuts Settings offers; anything else is Control + Option."""
+    name = (name or "").strip().lower()
+    if name not in CHORDS:
+        name = DEFAULT_CHORD
+    parts = set(name.split("+"))
+    return Chord(name, sum(bit for bit, key, _, _ in _KEYS if key in parts))
+
+
+def can_listen() -> bool:
+    """Whether macOS passes us keystrokes (Accessibility or Input Monitoring)."""
+    try:
+        import ApplicationServices as AX
+        import Quartz
+    except ImportError:
+        return False
+    try:
+        if AX.AXIsProcessTrusted():
+            return True
+        return bool(Quartz.CGPreflightListenEventAccess())
+    except Exception:
+        return False
+
+
+def keyboard_owner() -> str:
+    """App whose permission macOS checks: Plip, or the terminal that launched it."""
+    if ".app/Contents/" in sys.prefix + "/":
+        return "Plip"
+    terminals = {"Apple_Terminal": "Terminal", "iTerm.app": "iTerm", "vscode": "your code editor",
+                 "WarpTerminal": "Warp", "ghostty": "Ghostty"}
+    return terminals.get(os.environ.get("TERM_PROGRAM", ""), "the app you started Plip from")
+
 
 class ChordDetector:
     def __init__(self, *, on_press: Callable[[], None], on_release: Callable[[], None],
-                 on_cancel: Callable[[], None]):
+                 on_cancel: Callable[[], None], chord: int = CONTROL | OPTION):
         self.on_press = on_press
         self.on_release = on_release
         self.on_cancel = on_cancel
+        self.chord = chord
         self.held = False
         self._cancelled = False
 
-    @staticmethod
-    def chord_down(flags: int) -> bool:
-        return bool(flags & CONTROL) and bool(flags & OPTION) and not (flags & COMMAND)
+    def chord_down(self, flags: int) -> bool:
+        """All its modifiers held and no other ⌃/⌥/⌘ (another app's shortcut); a stray Shift is fine."""
+        others = (CONTROL | OPTION | COMMAND) & ~self.chord
+        return flags & self.chord == self.chord and not flags & others
+
+    def set_chord(self, mask: int) -> None:
+        """New shortcut from Settings; an in-progress press of the old one is dropped."""
+        if self.held:
+            self.held, self._cancelled = False, False
+            self.on_cancel()
+        self.chord = mask
 
     def flags_changed(self, flags: int) -> None:
         down = self.chord_down(flags)
@@ -39,6 +105,8 @@ class ChordDetector:
             self.held = True
             self._cancelled = False
             self.on_press()
+        elif not down and self.held and flags & self.chord == self.chord:
+            self.key_down()                  # e.g. ⌘ joined: another app's shortcut, not a release
         elif not down and self.held:
             self.held = False
             if self._cancelled:
@@ -55,18 +123,47 @@ class ChordDetector:
 class MacHotkeyListener:
     """Install the chord listener on the main run loop (main thread only)."""
 
-    def __init__(self, detector: ChordDetector):
+    def __init__(self, detector: ChordDetector, *, allowed: Callable[[], bool] = can_listen):
         self.detector = detector
+        self.allowed = allowed
         self.tap = None
         self.monitors: list = []
+        self.mechanism = "none"
+        self._live = False            # made while macOS was passing keys on
 
     def start(self) -> str:
-        """Returns which mechanism is active: 'event-tap', 'nsevent', or 'none'."""
-        if self._start_tap():
-            return "event-tap"
-        if self._start_monitors():
-            return "nsevent"
-        return "none"
+        """Which mechanism works: 'event-tap', 'nsevent', or 'none' (also when macOS withholds keys)."""
+        self._live = self.allowed()
+        self.mechanism = "event-tap" if self._start_tap() else "nsevent" if self._start_monitors() else "none"
+        return self.mode()
+
+    def mode(self) -> str:
+        """What works now; re-listens if permission came since (an older tap never hears)."""
+        if not self.allowed():
+            return "none"
+        if not self._live:
+            self.stop()
+            return self.start()
+        return self.mechanism
+
+    def stop(self) -> None:
+        try:
+            import Quartz
+
+            if self.tap is not None:
+                Quartz.CGEventTapEnable(self.tap, False)
+                Quartz.CFRunLoopRemoveSource(Quartz.CFRunLoopGetMain(), self._source, Quartz.kCFRunLoopCommonModes)
+                Quartz.CFMachPortInvalidate(self.tap)
+        except Exception:
+            pass
+        try:
+            import AppKit
+
+            for monitor in self.monitors:
+                AppKit.NSEvent.removeMonitor_(monitor)
+        except Exception:
+            pass
+        self.tap, self.monitors, self.mechanism = None, [], "none"
 
     def _start_tap(self) -> bool:
         try:

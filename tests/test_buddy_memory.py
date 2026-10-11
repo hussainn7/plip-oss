@@ -209,12 +209,14 @@ def test_ai_memory_paste_maps_known_keys_and_keeps_the_rest_as_notes():
 
 def test_remember_and_forget_actions(memory):
     engine = ActionEngine(ActionContext(host=FakeHost(), memory=memory))
+    engine.ctx.state["said"] = "remember that i like aisle seats"         # their own words ask for it
     done = asyncio.run(engine.handle("remember", {"fact": "my seat preference is aisle"}))
     assert done.status == "done" and memory.best("note").value == "my seat preference is aisle"
     private = asyncio.run(engine.handle("remember", {"fact": "passport number: X1234567"}))
     assert "keep that private" in private.result.say
     assert asyncio.run(engine.handle("remember", {"fact": "email: new@example.com"})).status == "done"
     assert "new@example.com" in memory.values("email")
+    engine.ctx.state["said"] = "forget my seat preference"
     gone = asyncio.run(engine.handle("forget", {"about": "seat preference"}))
     assert gone.status == "done" and all("seat" not in fact.value for fact in memory.facts)
     assert asyncio.run(engine.handle("forget", {"about": "dragons"})).status == "failed"
@@ -228,6 +230,8 @@ def test_companion_turns_carry_what_plip_knows(memory):
     buddy = Companion(brain=brain, capturer=Capturer(), speaker=Speaker(), pointer=Pointer(), observer=Events(),
                       notes=make_notes(memory))
     asyncio.run(buddy.respond("what should I eat tonight"))
-    text = brain.calls[0][-1].text
-    assert "about the user" in text and "- name: Hussain Syed" in text and "- vegetarian" in text
-    assert text.index("about the user") < text.index("the user said: what should I eat tonight")
+    system, text = brain.systems[0], brain.calls[0][-1].text
+    assert "about the user" in system and "- name: Hussain Syed" in system and "- vegetarian" in system
+    assert system.index("you're plip") < system.index("about the user")
+    # notes ride in the cached prompt; the clock stays per turn
+    assert "about the user" not in text and text.startswith("now: ") and text.endswith("what should I eat tonight")

@@ -1,9 +1,9 @@
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertTriangle, Check, ChevronUp, Clock3, FileText, Settings2, Sparkles, Square, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronUp, Clock3, FileText, Settings2, Square, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { island, send, useStore, type IslandState, type Mood, type Phase } from '../bridge'
+import { island, isNative, send, shortcut, useStore, type IslandState, type Mood, type Phase } from '../bridge'
 import { Mascot } from '../components/Mascot'
-import { EngineBadge, Keycap, StepChips, StreamingText, Waveform, cn } from '../components/bits'
+import { Chord, EngineBadge, StepChips, StreamingText, Waveform, cn } from '../components/bits'
 
 type Mode = 'hidden' | 'compact' | 'mini' | 'peek' | Exclude<Phase, 'idle'>
 
@@ -20,6 +20,8 @@ const MOOD: Record<Mode, Mood> = {
 
 const SPRING = { type: 'spring', stiffness: 420, damping: 34, mass: 0.9 } as const
 const LINGER_MS = 7000
+const ERROR_LINGER_MS = 8000
+const HOVER_DWELL_MS = 400       // rest before opening: passing by isn't asking
 const MAX_BODY = 360
 
 /** Concave "shoulder" that makes the island read as part of the notch. */
@@ -41,8 +43,9 @@ function Shoulder({ side, size }: { side: 'left' | 'right'; size: number }) {
 export function Island() {
   const state = useStore(island)
   const [pointerHover, setHover] = useState(false)
-  // The native host tracks hover itself (WebKit tracking areas are flaky in a never-key panel).
-  const hover = pointerHover || state.hovered
+  // In the app, only the native hover counts: WebKit misses mouseleave once the panel stops taking the mouse,
+  // which left the island stuck open (after Stop, say). The pointer is for the browser preview.
+  const hover = useDwell(isNative() ? state.hovered : pointerHover || state.hovered, HOVER_DWELL_MS)
   const [lingerOver, setLingerOver] = useState(false)
   const [minimizedLocal, setMinimized] = useState(false)
   const minimized = minimizedLocal || Boolean(state.minimized)
@@ -57,16 +60,20 @@ export function Island() {
     if (state.confirm) setMinimized(false)
   }, [state.confirm])
 
-  // Finished answers linger, then tuck back into the notch unless hovered or waiting on a confirm.
+  // Answers linger after the voice stops, then tuck away unless hovered or confirming.
   useEffect(() => {
     setLingerOver(false)
-    if (state.phase !== 'answering' || !state.done || state.confirm) return
-    const timer = window.setTimeout(() => setLingerOver(true), LINGER_MS + state.plan.length * 2500)
+    const answered = state.phase === 'answering' && state.done && !state.speaking && !state.confirm
+    if (!answered && state.phase !== 'error') return
+    // an open suggestion stays longer, to leave time to click; an error card goes back to idle too
+    const linger = state.phase === 'error' ? ERROR_LINGER_MS : state.finished === 'bye' ? 600
+      : state.finished === 'done' ? 3500 : LINGER_MS + state.plan.length * 2500 + (state.offer ? 8000 : 0)
+    const timer = window.setTimeout(() => setLingerOver(true), linger)
     return () => window.clearTimeout(timer)
-  }, [state.phase, state.done, state.answer, state.confirm, state.plan.length])
+  }, [state.phase, state.done, state.speaking, state.answer, state.confirm, state.plan.length, state.offer, state.finished, state.error])
 
   let mode: Mode
-  if (state.phase === 'idle' || (state.phase === 'answering' && lingerOver && !hover)) {
+  if (state.phase === 'idle' || ((state.phase === 'answering' || state.phase === 'error') && lingerOver && !hover)) {
     mode = hover ? 'peek' : state.idleVisible ? 'compact' : 'hidden'
   } else if (minimized && (state.phase === 'answering' || state.phase === 'error')) {
     mode = hover ? state.phase : 'mini'
@@ -95,6 +102,22 @@ export function Island() {
 
   const height = expanded ? notchH + Math.min(bodyHeight, MAX_BODY) : notchH
   const radius = expanded ? 26 : Math.round(notchH * 0.42)
+
+  // Open/close sounds on every open and close. Not into listening (mic's on); jitter = one plip, fly-by = silent.
+  const lastMode = useRef(mode)
+  const openedAt = useRef(-Infinity)
+  useEffect(() => {
+    const was = lastMode.current
+    lastMode.current = mode
+    const closed = (m: Mode) => m === 'compact' || m === 'hidden' || m === 'mini'
+    const now = performance.now()
+    if (closed(was) && !closed(mode)) {
+      if (mode !== 'listening' && now - openedAt.current > 400) send('sound', { name: 'open' })
+      openedAt.current = now
+    } else if (!closed(was) && closed(mode) && was !== 'listening' && now - openedAt.current > 300) {
+      send('sound', { name: 'close' })
+    }
+  }, [mode])
 
   // Tell the native window which pixels are interactive (the rest clicks through).
   useEffect(() => {
@@ -133,7 +156,8 @@ export function Island() {
                     exit={{ opacity: 0 }}
                     className="text-[12px] font-semibold tracking-tight text-white/80"
                   >
-                    {mode === 'listening' ? 'Listening' : mode === 'thinking' ? 'Thinking' : mode === 'error' ? 'Hmm' : state.confirm ? 'Your call' : 'Plip'}
+                    {mode === 'listening' ? 'Listening' : mode === 'thinking' ? 'Thinking' : mode === 'error' ? 'Hmm'
+                      : state.confirm ? 'Your call' : state.finished === 'done' ? 'Done' : 'Plip'}
                   </motion.span>
                 )}
               </AnimatePresence>
@@ -141,7 +165,7 @@ export function Island() {
           </div>
           <div style={{ width: notchW }} />
           <div className="flex h-full items-center justify-end gap-1.5 pr-3" style={{ width: earWidth }}>
-            <RightEar mode={mode} level={state.level} done={state.done} />
+            <RightEar mode={mode} level={state.level} done={state.done && !state.speaking} finished={state.finished === 'done'} />
             {expanded && (mode === 'answering' || mode === 'error') && (
               <button
                 aria-label="Minimize"
@@ -182,8 +206,9 @@ export function Island() {
   )
 }
 
-function RightEar({ mode, level, done }: { mode: Mode; level: number; done: boolean }) {
+function RightEar({ mode, level, done, finished }: { mode: Mode; level: number; done: boolean; finished: boolean }) {
   if (mode === 'listening') return <Waveform level={level} bars={9} color="bg-dew" />
+  if (finished && done && (mode === 'answering' || mode === 'mini')) return <Check className="size-3.5 text-mint" strokeWidth={3} />
   // TTS reports no level; keep the bars alive while Plip is still talking.
   if (mode === 'answering' || mode === 'mini')
     return done && mode === 'mini' ? <Check className="size-3.5 text-mint" strokeWidth={3} /> : <Waveform level={done ? 0.04 : Math.max(level, 0.42)} bars={7} color="bg-plip-200" />
@@ -201,22 +226,34 @@ function RightEar({ mode, level, done }: { mode: Mode; level: number; done: bool
       </span>
     )
   if (mode === 'error') return <AlertTriangle className="size-3.5 text-coral" />
-  if (mode === 'peek') return <Sparkles className="size-3.5 text-plip-300" />
+  if (mode === 'peek') return <Waveform level={0.08} bars={5} color="bg-plip-200/70" />    // resting: hold to talk
   return <span className="size-1.5 rounded-full bg-plip-300/60 shadow-[0_0_8px_rgba(143,179,250,0.7)]" />
 }
 
 function Body({ mode }: { mode: Mode }) {
   const state = useStore(island)
+  const works = useStore(shortcut).works !== false
 
   if (mode === 'peek') {
     return (
       <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2 text-[13px] text-white/70">
-          <span>Hold</span>
-          <Keycap>⌃</Keycap>
-          <Keycap>⌥</Keycap>
-          <span>and ask, or tell me to do something</span>
-        </div>
+        {works ? (
+          <div className="flex items-center gap-2 text-[13px] text-white/70">
+            <span>Hold</span>
+            <Chord />
+            <span>and ask, or tell me to do something</span>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2.5 text-[13px] text-amber-100/85">
+            <span>Your shortcut is off until you allow Accessibility</span>
+            <button
+              onClick={() => send('grant', { permission: 'accessibility' })}
+              className="rounded-full bg-white px-3 py-1 text-[12px] font-semibold text-slate-950 hover:bg-plip-50"
+            >
+              Allow
+            </button>
+          </div>
+        )}
         <div className="flex items-center gap-1">
           <IconButton label="History" onClick={() => send('open-settings', { tab: 'history' })}>
             <Clock3 className="size-4" />
@@ -247,7 +284,10 @@ function Body({ mode }: { mode: Mode }) {
   if (mode === 'thinking') {
     return (
       <div className="space-y-2.5">
-        {state.transcript && <p className="truncate text-[13px] text-white/45">“{state.transcript}”</p>}
+        <div className="flex items-center justify-between gap-3">
+          {state.transcript ? <p className="min-w-0 truncate text-[13px] text-white/45">“{state.transcript}”</p> : <span />}
+          <StopButton />
+        </div>
         <StepChips steps={state.steps} />
         {state.steps.length === 0 && <p className="shimmer-text text-[15px] font-medium">Looking at your screen…</p>}
       </div>
@@ -258,12 +298,14 @@ function Body({ mode }: { mode: Mode }) {
     return (
       <div className="flex items-start justify-between gap-4">
         <p className="text-[14px] leading-snug text-rose-100/90">{state.error || 'Something went sideways.'}</p>
-        <button
-          className="shrink-0 rounded-full bg-white/10 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-white/15"
-          onClick={() => send('open-settings', { tab: 'brain' })}
-        >
-          Fix setup
-        </button>
+        {state.fixable && (
+          <button
+            className="shrink-0 rounded-full bg-white/10 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-white/15"
+            onClick={() => send('open-settings', { tab: 'brain' })}
+          >
+            Fix setup
+          </button>
+        )}
       </div>
     )
   }
@@ -278,24 +320,44 @@ function Body({ mode }: { mode: Mode }) {
       </div>
       {state.results.length > 0 && <Results items={state.results} />}
       {state.confirm && <ConfirmCard />}
+      {!state.confirm && state.offer && state.done && <OfferButtons />}
       {!state.confirm && (
         <div className="flex items-center justify-between gap-3">
           <StepChips steps={state.steps.filter((step) => step.status !== 'active').slice(-2)} max={2} />
           <div className="flex items-center gap-2">
-            {!state.done && (
-              <button
-                onClick={() => send('stop')}
-                className="flex items-center gap-1 rounded-full bg-white/[0.06] px-2 py-1 text-[10.5px] font-medium text-white/55 hover:bg-white/10 hover:text-white"
-              >
-                <Square className="size-2.5 fill-current" /> Stop
-              </button>
-            )}
+            {(!state.done || state.speaking) && <StopButton />}
             <EngineBadge engine={state.engine} latencyMs={state.latencyMs} />
           </div>
         </div>
       )}
     </div>
   )
+}
+
+/** Stops thinking, acting, or talking. */
+function StopButton() {
+  return (
+    <button
+      onClick={() => send('stop')}
+      className="flex shrink-0 items-center gap-1 rounded-full bg-white/[0.06] px-2 py-1 text-[10.5px] font-medium text-white/55 hover:bg-white/10 hover:text-white"
+    >
+      <Square className="size-2.5 fill-current" /> Stop
+    </button>
+  )
+}
+
+/** `on`, once it holds for `ms`; drops at once. */
+function useDwell(on: boolean, ms: number) {
+  const [settled, setSettled] = useState(false)
+  useEffect(() => {
+    if (!on) {
+      setSettled(false)
+      return
+    }
+    const timer = window.setTimeout(() => setSettled(true), ms)
+    return () => window.clearTimeout(timer)
+  }, [on, ms])
+  return settled
 }
 
 function WalkthroughBar({ state }: { state: IslandState }) {
@@ -396,7 +458,7 @@ function ConfirmCard() {
         </ul>
       )}
       <div className="mt-3 flex items-center justify-between">
-        <span className="text-[11px] text-white/35">or just say “yes”</span>
+        <span className="flex items-center gap-1 text-[11px] text-white/35">or hold <Chord className="h-5 min-w-5 rounded-md px-1 text-[10px]" /> and say yes</span>
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => send('confirm-action', { accept: false })}
@@ -411,6 +473,33 @@ function ConfirmCard() {
             <Check className="size-3.5" strokeWidth={3} /> {confirm.confirm}
           </button>
         </div>
+      </div>
+    </motion.div>
+  )
+}
+
+/** Yes / No thanks for Plip's closing suggestion. */
+function OfferButtons() {
+  const answer = (accept: boolean) => {
+    island.set({ offer: null })
+    send('offer-answer', { accept })
+  }
+  return (
+    <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} transition={SPRING} className="flex items-center justify-between gap-3">
+      <span className="flex items-center gap-1 text-[11px] text-white/35">or hold <Chord className="h-5 min-w-5 rounded-md px-1 text-[10px]" /> and say it</span>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={() => answer(false)}
+          className="rounded-full px-3 py-1.5 text-[12px] font-medium text-white/65 hover:bg-white/10 hover:text-white"
+        >
+          No thanks
+        </button>
+        <button
+          onClick={() => answer(true)}
+          className="flex items-center gap-1 rounded-full bg-white px-3.5 py-1.5 text-[12px] font-semibold text-slate-950 shadow-[0_6px_18px_-6px_rgba(255,255,255,0.5)] hover:bg-plip-50"
+        >
+          <Check className="size-3.5" strokeWidth={3} /> Yes
+        </button>
       </div>
     </motion.div>
   )

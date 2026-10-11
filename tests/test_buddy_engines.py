@@ -20,7 +20,7 @@ from mcp_vision.buddy.companion import Companion, _friendly_error
 from mcp_vision.buddy.conversation import Turn
 from mcp_vision.buddy.engines import (
     BY_ID, SPECS, ClaudeCodeBrain, ClaudeCodeParser, CodexBrain, CodexParser, CursorBrain, CursorParser,
-    EngineError, EngineRegistry, EngineStatus, GeminiBrain, GeminiParser, RunResult, choose_engine,
+    AntigravityBrain, EngineError, EngineRegistry, EngineStatus, RunResult, choose_engine,
     find_binary, make_engine_brain, probe, transcript_prompt,
 )
 from mcp_vision.buddy.geometry import Rect, ScreenInfo, Screenshot
@@ -54,7 +54,8 @@ TURNS = [Turn("user", "where is wifi"), Turn("assistant", "Top right. [POINT:120
 # -- discovery and probes ------------------------------------------------------------
 
 def test_specs_cover_the_subscriptions_people_have():
-    assert [spec.id for spec in SPECS] == ["claude-code", "codex", "cursor", "gemini", "anthropic"]
+    assert [spec.id for spec in SPECS] == ["claude-code", "codex", "cursor", "antigravity", "anthropic", "gemini-api"]
+    assert BY_ID["gemini-api"].kind == "api" and BY_ID["gemini-api"].key_name == "GEMINI_API_KEY"   # free, no plan
     assert {spec.label for spec in SPECS if spec.kind == "subscription"} == {"Claude", "ChatGPT", "Cursor", "Gemini"}
     assert BY_ID["cursor"].vision is False and BY_ID["claude-code"].vision is True
 
@@ -133,11 +134,6 @@ def test_probe_codex_cursor_gemini(tmp_path):
     cursor_out = probe(BY_ID["cursor"], settings, which=which, home=tmp_path, runner=runner_for(
         {("status", "--format", "json"): RunResult(1, "Not logged in", "")}))
     assert cursor_out.status == "logged-out" and cursor_out.card()["login"] == "/usr/local/bin/cursor-agent login"
-    gemini = probe(BY_ID["gemini"], settings, which=which, home=tmp_path, runner=runner_for({}))
-    assert gemini.status == "logged-out"
-    (tmp_path / ".gemini").mkdir()
-    (tmp_path / ".gemini" / "oauth_creds.json").write_text("{}")
-    assert probe(BY_ID["gemini"], settings, which=which, home=tmp_path, runner=runner_for({})).status == "ready"
 
 
 def test_probe_missing_cli_and_api_keys(monkeypatch):
@@ -275,21 +271,6 @@ def test_cursor_parser_keeps_deltas_and_skips_flushes():
     assert feed(whole, [cursor_assistant("Hi."), {"type": "result", "subtype": "success", "result": "Hi."}]) == ["Hi."]
 
 
-def test_gemini_parser_streams_assistant_messages():
-    parser = GeminiParser()
-    events = [{"type": "init", "model": "gemini"}, {"type": "message", "role": "user", "content": "q"},
-              {"type": "message", "role": "assistant", "content": "Use ", "delta": True},
-              {"type": "message", "role": "assistant", "content": "Spotlight.", "delta": True},
-              {"type": "result", "status": "success"}]
-    assert feed(parser, events) == ["Use ", "Spotlight."]
-    warned = GeminiParser()
-    feed(warned, [{"type": "error", "severity": "warning", "message": "loop detected"}])
-    assert warned.error == ""
-    failed = GeminiParser()
-    feed(failed, [{"type": "result", "status": "error", "error": {"message": "quota exceeded"}}])
-    assert failed.error == "quota exceeded"
-
-
 # -- real subprocesses ---------------------------------------------------------------------------
 
 def test_claude_code_brain_streams_images_through_stdin(tmp_path):
@@ -371,16 +352,15 @@ def test_cursor_brain_is_text_only(tmp_path):
     assert asyncio.run(collect(brain, TURNS)) == "Top right."
 
 
-def test_gemini_brain_references_screens_by_file(tmp_path):
-    binary = fake_cli(tmp_path, "gemini", """
-        prompt = argv[argv.index("--prompt") + 1]
-        assert prompt.startswith("@screen1.jpg") and os.path.exists("screen1.jpg")
-        assert "--skip-trust" in argv and "SYSTEM" not in prompt
-        assert open(os.environ["GEMINI_SYSTEM_MD"]).read() == "SYSTEM"
-        out({"type": "message", "role": "assistant", "content": "Bluetooth's up top.", "delta": True})
-        out({"type": "result", "status": "success"})
+def test_antigravity_runs_sandboxed_text_only_at_the_asked_depth(tmp_path):
+    binary = fake_cli(tmp_path, "agy", """
+        assert argv[argv.index("-p") + 1].startswith("<instructions>") and "--sandbox" in argv
+        assert argv[argv.index("--model") + 1] == "gemini-3.8-flash-high"
+        out({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "Bluetooth's up top."}})
+        out({"event": "result", "result": {"status": "SUCCESS", "response": "Bluetooth's up top."}})
     """)
-    assert asyncio.run(collect(GeminiBrain(binary), TURNS)) == "Bluetooth's up top."
+    brain = AntigravityBrain(binary, effort="high")
+    assert brain.vision is False and asyncio.run(collect(brain, TURNS)) == "Bluetooth's up top."
 
 
 def test_cli_errors_become_friendly_messages(tmp_path):
@@ -404,11 +384,11 @@ def test_cli_errors_become_friendly_messages(tmp_path):
     with pytest.raises(EngineError):
         asyncio.run(collect(CursorBrain(str(tmp_path / "missing")), TURNS))
 
-    silent = fake_cli(tmp_path, "gemini", """
-        out({"type": "init"})
+    silent = fake_cli(tmp_path, "agy", """
+        out({"event": "init"})
     """)
     with pytest.raises(EngineError, match="returned no answer"):
-        asyncio.run(collect(GeminiBrain(silent), TURNS))
+        asyncio.run(collect(AntigravityBrain(silent), TURNS))
 
 
 def test_cli_timeout_and_cancellation_kill_the_process(tmp_path):
@@ -559,15 +539,15 @@ def test_codex_cursor_and_gemini_report_their_own_spellings(tmp_path):
     asyncio.run(collect(brain, TURNS))
     assert (brain.last_usage.input, brain.last_usage.cache_write, brain.last_usage.model) == (50, 2, "sonnet-5")
 
-    gemini = fake_cli(tmp_path, "gemini", """
-        out({"type": "message", "role": "assistant", "content": "Sure.", "delta": True})
-        out({"type": "result", "status": "success", "stats": {"input": 700, "cached": 200, "output_tokens": 5,
-             "thoughts": 3, "models": {"gemini-2.5-pro": {}}}})
+    agy = fake_cli(tmp_path, "agy", """
+        out({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "Sure."}})
+        out({"event": "result", "result": {"status": "SUCCESS", "response": "Sure.",
+             "usage": {"input_tokens": 700, "output_tokens": 5, "cache_read_tokens": 200}}})
     """)
-    brain = GeminiBrain(gemini)
+    brain = AntigravityBrain(agy)
     asyncio.run(collect(brain, TURNS))
-    assert (brain.last_usage.input, brain.last_usage.cache_read, brain.last_usage.output) == (500, 200, 8)
-    assert brain.last_usage.model == "gemini-2.5-pro"
+    assert (brain.last_usage.input, brain.last_usage.cache_read, brain.last_usage.output) == (500, 200, 5)
+    assert brain.last_usage.model == "gemini-3.8-flash-low"
 
 
 def test_a_brain_that_reports_nothing_leaves_no_usage(tmp_path):
@@ -626,44 +606,125 @@ def test_the_app_keeps_the_next_claude_process_warm_and_reuses_it(tmp_path):
         brain = ClaudeCodeBrain(binary)
         brain.prewarm = True
         answers = [await collect(brain, TURNS)]
-        for _ in range(100):                                  # the next process starts in the background
-            if getattr(brain, "_warm", None) is not None:
+        for _ in range(50):                                   # next process starts in the background
+            if brain._spares:
                 break
             await asyncio.sleep(0.02)
-        warm_pid = brain._warm[1].pid
+        warm_pid = next(iter(brain._spares.values()))[0].pid
         answers.append(await collect(brain, TURNS))           # same command line: uses the warm one
         await asyncio.sleep(0.2)
         answers.append(await collect(brain, TURNS, detailed=True))   # different effort: a fresh process
         await brain.aclose()
-        return answers, warm_pid, brain
+        return answers, warm_pid
 
-    answers, warm_pid, brain = asyncio.run(three_turns())
+    answers, warm_pid = asyncio.run(three_turns())
     pids = [int(line) for line in marker.read_text().split()]
     assert answers == ["ok", "ok", "ok"] and pids[1] == warm_pid
-    assert getattr(brain, "_warm", None) is None and brain.prewarm is False
 
 
-def test_an_old_warm_process_is_replaced_and_one_shot_runs_leave_none(tmp_path):
+def test_the_companion_warms_a_brain_that_keeps_spares_and_skips_one_that_doesnt():
+    from buddy_fakes import Capturer, ScriptedBrain
+
+    asked = []
+
+    class Spare(ScriptedBrain):
+        prewarm = True
+
+        def ensure_warm(self, system, effort=None):
+            asked.append((system[:10], effort))
+
+    Companion(brain=Spare(), capturer=Capturer()).warm_brain()
+    Companion(brain=ScriptedBrain(), capturer=Capturer()).warm_brain()       # nothing to warm: no error
+    off = Spare()
+    off.prewarm = False                                                       # one-shot runs: never
+    Companion(brain=off, capturer=Capturer()).warm_brain()
+    assert asked == [("you're pli", None)]
+
+
+def test_one_shot_runs_dont_leave_a_process_waiting(tmp_path):
     binary = fake_cli(tmp_path, "claude", """
         out({"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
     """)
     brain = ClaudeCodeBrain(binary)
-    assert asyncio.run(collect(brain, TURNS)) == "ok" and getattr(brain, "_warm", None) is None
+    assert asyncio.run(collect(brain, TURNS)) == "ok" and not brain._spares
 
-    async def stale():
-        warm = ClaudeCodeBrain(binary)
-        warm.prewarm = True
-        warm.warm_ttl = 0.0                                   # anything warm is already too old
-        await collect(warm, TURNS)
+
+def test_a_process_starts_while_the_keys_are_held_and_an_unused_one_goes_away(tmp_path):
+    marker = tmp_path / "pids"
+    binary = fake_cli(tmp_path, "claude", f"""
+        open({str(marker)!r}, "a").write(str(os.getpid()) + "\\n")
+        out({{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}})
+    """)
+
+    async def press_then_ask():
+        brain = ClaudeCodeBrain(binary, effort="medium")
+        brain.prewarm, brain.idle_ttl = True, 0.6
+        brain.ensure_warm("SYSTEM")                          # key press: nothing to say yet
+        brain.ensure_warm("SYSTEM")                          # second press: no extra process
         for _ in range(100):
-            if getattr(warm, "_warm", None) is not None:
+            if brain._spares:
                 break
             await asyncio.sleep(0.02)
-        old = warm._warm[1]
-        assert await collect(warm, TURNS) == "ok"             # started fresh; the old one is gone
-        await asyncio.sleep(0.1)
-        await warm.aclose()
-        return old
+        spare_pid = next(iter(brain._spares.values()))[0].pid
+        answer = await collect(brain, TURNS)                 # question arrives: uses the spare
+        brain.ensure_warm("SYSTEM", effort="low")            # low-effort spare for a check-in
+        await asyncio.sleep(0.3)
+        efforts = sorted(key[0][key[0].index("--effort") + 1] for key in brain._spares)
+        await asyncio.sleep(1.0)                             # unused: reaped
+        left = dict(brain._spares)
+        await brain.aclose()
+        return answer, spare_pid, efforts, left
 
-    old = asyncio.run(stale())
-    assert old.returncode is not None
+    answer, spare_pid, efforts, left = asyncio.run(press_then_ask())
+    pids = [int(line) for line in marker.read_text().split()]
+    assert answer == "ok" and pids[0] == spare_pid and efforts == ["low", "medium"] and left == {}
+
+
+def test_a_brain_that_starts_running_a_command_is_stopped_before_anything_it_read_comes_back(tmp_path):
+    from mcp_vision.buddy.companion import _friendly_error
+
+    codex = fake_cli(tmp_path, "codex", """
+        out({"type": "item.started", "item": {"id": "c1", "type": "command_execution", "command": "cat ~/.ssh/id_rsa"}})
+        out({"type": "item.completed", "item": {"id": "m1", "type": "agent_message",
+                                                "text": "here it is: -----BEGIN KEY----- [DO:open_url {\\"url\\": \\"x\\"}]"}})
+    """)
+    agy = fake_cli(tmp_path, "agy", """
+        out({"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "view_file"}})
+        out({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "the file says ..."}})
+    """)
+    said = []
+
+    async def run(brain):
+        async for text in brain.stream(system="SYSTEM", turns=TURNS):
+            said.append(text)
+    for brain in (CodexBrain(codex), AntigravityBrain(agy)):
+        with pytest.raises(EngineError) as stopped:
+            asyncio.run(run(brain))
+        assert "tried to run a command" in str(stopped.value)
+        assert _friendly_error(stopped.value).startswith("My brain tried to run a command on your Mac")
+    assert said == []                                                  # nothing it read was spoken or acted on
+
+
+def test_gemini_on_a_google_plan_goes_through_antigravity(tmp_path, monkeypatch):
+    from mcp_vision.buddy.engines import AntigravityParser, choose_engine
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    settings = BuddySettings(_env_file=None)
+    (tmp_path / ".gemini").mkdir()
+    assert probe(BY_ID["antigravity"], settings, which=lambda names: "/x/agy", home=tmp_path).status == "logged-out"
+    (tmp_path / ".gemini" / "jetski-standalone-oauth-token").write_text("t")
+    agy = probe(BY_ID["antigravity"], settings, which=lambda names: "/x/agy", home=tmp_path)
+    assert agy.status == "ready" and choose_engine(settings, [agy], preferred="gemini").spec.id == "antigravity"   # an old pick
+    parser = AntigravityParser()
+    parser.model = "gemini-3.8-flash-medium"
+    lines = ['{"event":"init","init":{"tools":["run_command"]}}',
+             '{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"hello"}}',
+             '{"event":"result","result":{"status":"SUCCESS","response":"hello\\n","usage":{"input_tokens":100,'
+             '"output_tokens":5,"cache_read_tokens":40}}}']
+    assert [text for line in lines for text in parser.feed(line)] == ["hello"] and parser.ended
+    assert (parser.usage.input, parser.usage.cache_read, parser.usage.output) == (60, 40, 5)
+    tool = AntigravityParser()
+    tool.model = ""
+    tool.feed('{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"view_file"}}')
+    assert tool.error and tool.ended                                      # stopped before it reads anything back

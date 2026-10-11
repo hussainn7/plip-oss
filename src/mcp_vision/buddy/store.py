@@ -10,6 +10,7 @@ from pathlib import Path
 from mcp_vision.paths import state_dir
 
 
+
 def config_dir() -> Path:
     return Path(os.environ.get("MCP_VISION_CONFIG_DIR", Path.home() / ".config" / "mcp-vision"))
 
@@ -19,12 +20,19 @@ class Prefs:
     engine: str = ""                 # engine id; "" = best available
     depth: str = "balanced"          # fast | balanced | deep
     walkthroughs: bool = True
+    sounds: bool = True              # notch UI sounds (buddy/sounds.py)
     buddy: bool = True               # show Plip by the cursor while idle
     companion: str = "notch"         # notch: Plip lives in the notch and drips out to point | cursor | hidden
     tts: str = ""                    # "" = follow settings/env
     stt: str = ""
     onboarded: bool = False
+    tour_step: str = ""              # welcome tour step, resumed after a restart
     update_check: bool = True        # once a day, ask GitHub whether a newer Plip is out
+    hotkey: str = "control+option"   # hold to talk: one of hotkey.CHORDS
+    tasks_done: int = 0              # finished tasks, ever (the 1st and 3rd are when Plip asks for Google)
+    signin_asks: int = 0             # times they tapped Later on the Google card; after 3, Plip stops asking
+    asked_on_update: bool = False    # the "a newer Plip is out" moment was used
+    milestones: list[str] = field(default_factory=list)   # funnel events sent once per install (analytics)
 
     @classmethod
     def load(cls, path: Path | None = None) -> Prefs:

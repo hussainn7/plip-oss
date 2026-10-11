@@ -5,8 +5,8 @@ import {
 import { useEffect, useRef, useState } from 'react'
 import { send, settings, useStore } from '../../bridge'
 import { Mascot } from '../../components/Mascot'
-import { Keycap, cn } from '../../components/bits'
-import { AccountTab, Avatar, SignIn } from './account'
+import { Chord, cn } from '../../components/bits'
+import { AccountTab, Avatar } from './account'
 import { HistoryPanel, PermissionsTab, VoiceTab } from './basics'
 import { BrainTab } from './brain'
 import { GeneralTab, type Composer } from './general'
@@ -80,17 +80,30 @@ export function Settings() {
     }
     window.addEventListener('hashchange', onHash)
     send('settings-ready')
-    return () => window.removeEventListener('hashchange', onHash)
+    // Back from System Settings or a sign-in: refresh (at most every 5 s).
+    let checked = Date.now()
+    const onFocus = () => {
+      if (document.visibilityState === 'hidden' || Date.now() - checked < 5000) return
+      checked = Date.now()
+      send('refresh')
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      window.removeEventListener('hashchange', onHash)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
   }, [])
 
   const engine = state.engines.find((item) => item.selected)
   const ready = engine && (engine.status === 'ready' || engine.status === 'unknown')
 
-  if (state.account.required) return <SignIn state={state} />
   const user = state.account.user
+  const accounts = state.account.available
 
   return (
-    <div className="relative flex h-full overflow-hidden bg-ink text-white noise">
+    <div className="relative flex h-full overflow-clip bg-ink text-white noise">
       <div className="pointer-events-none absolute -left-48 -top-64 size-[560px] rounded-full bg-plip-500/[0.14] blur-[130px] animate-aurora" />
       <div className="pointer-events-none absolute -right-56 top-56 size-[460px] rounded-full bg-sky-glow/[0.08] blur-[130px] animate-aurora [animation-delay:-7s]" />
 
@@ -107,7 +120,7 @@ export function Settings() {
             <div key={group.title || 'top'}>
               {group.title && <div className="mb-1.5 px-2.5 text-[10.5px] font-semibold uppercase tracking-[0.14em] text-white/25">{group.title}</div>}
               <div className="space-y-0.5">
-                {group.tabs.filter(({ id }) => id !== 'account' || user).map(({ id, label, icon: Icon }) => (
+                {group.tabs.filter(({ id }) => id !== 'account' || accounts).map(({ id, label, icon: Icon }) => (
                   <button
                     key={id}
                     onClick={() => setTab(id)}
@@ -135,8 +148,7 @@ export function Settings() {
             <span className="text-white/60">{ready ? `Ready · ${engine?.label}` : 'Needs a brain'}</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <Keycap className="h-6 min-w-6 text-[12px]">⌃</Keycap>
-            <Keycap className="h-6 min-w-6 text-[12px]">⌥</Keycap>
+            <Chord className="h-6 min-w-6 text-[12px]" />
             <span className="ml-1 text-[11px] text-white/35">hold to talk</span>
           </div>
         </div>

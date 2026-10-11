@@ -49,10 +49,14 @@ export interface IslandState {
   transcript: string
   answer: string
   done: boolean
+  speaking: boolean          // voice still playing (can outlast the text)
+  finished: 'done' | 'bye' | null   // the request ended: a task done, or they said bye
+  offer: string | null       // yes/no suggestion it ended on
   steps: Step[]
   walkthrough: Walkthrough | null
   engine: EngineBadge | null
   error: string
+  fixable: boolean           // fixable in settings: shows "Fix setup"
   latencyMs: number | null
   notch: { width: number; height: number; hasNotch: boolean }
   idleVisible: boolean
@@ -74,7 +78,7 @@ export interface MascotState {
   label: string
 }
 
-export type EngineStatus = 'ready' | 'not-installed' | 'logged-out' | 'missing-key' | 'unknown'
+export type EngineStatus = 'ready' | 'not-installed' | 'logged-out' | 'missing-key' | 'unknown' | 'unavailable'
 
 export interface Engine {
   id: string
@@ -88,6 +92,30 @@ export interface Engine {
   keyName?: string
   selected?: boolean
   vision?: boolean
+  connect?: ConnectProgress  // install + browser sign-in progress
+}
+
+export type TourStep = 'welcome' | 'permissions' | 'brain' | 'try' | 'done'
+
+export interface LiveState {
+  phase: 'idle' | 'listening' | 'thinking' | 'answering' | 'done' | 'error'
+  transcript: string
+  answer: string
+  error: string
+  at: number                 // epoch seconds this phase began
+}
+
+export interface KeyCheck {
+  name: string               // e.g. GEMINI_API_KEY; '' if no key found
+  state: 'checking' | 'ok' | 'bad'
+  message: string
+}
+
+export interface ConnectProgress {
+  state: 'installing' | 'signing-in' | 'ready' | 'failed'
+  message: string
+  url?: string               // sign-in page, if the browser didn't open
+  needsCode?: boolean        // page shows a code to paste back
 }
 
 export interface HistoryItem {
@@ -185,14 +213,34 @@ export interface UsageState {
   billed: number
 }
 
-/** Signing in (with Google, through Supabase) before Plip works. Builds without a sign-in project never ask. */
+/**
+ * The account (through Supabase): a guest after the walkthrough (a name like Quiet Nomad), Google when they're
+ * ready. Never between the person and the hotkey. Builds without a Supabase project have no accounts at all.
+ */
 export interface AccountState {
-  available: boolean         // this build has sign-in
-  required: boolean          // not signed in yet: the sign-in screen comes first
+  available: boolean         // this build has accounts
+  identified: boolean        // signed in with Google: an email
+  anonymous: boolean         // a guest: an account, no sign-in yet
+  prompt: boolean            // Home shows the Google card (after the 1st and 3rd task, and once for an update)
   status?: '' | 'waiting' | 'failed'
   error?: string
   url?: string               // the sign-in page, while waiting
-  user?: { name: string; email: string; provider: string; since: number | null } | null
+  user?: { name: string; email: string; provider: string; since: number | null; picture?: string } | null  // picture: their Google one, as a data: url
+}
+
+/** Hold-to-talk shortcut: keys (⌃⌥) and words. */
+export interface Shortcut {
+  id: string
+  keys: string[]
+  label: string
+  works?: boolean            // false without Accessibility
+}
+
+/** General's shortcut picker: choice, options, whether it works. */
+export interface HotkeyState extends Shortcut {
+  works: boolean
+  owner: string              // app needing Accessibility: Plip or its terminal
+  choices: Shortcut[]
 }
 
 /** A newer Plip on GitHub (asked once a day, unless they turned it off). */
@@ -219,15 +267,20 @@ export interface SettingsState {
   keys: Record<string, boolean>
   history: HistoryItem[]
   walkthroughs: boolean
+  sounds: boolean
   memory: MemoryPanel | null
   companion: 'notch' | 'cursor' | 'hidden'
   stats: { actionsWeek: number; answers: number; minutesSaved: number }
   usage: UsageState | null
   onboarded: boolean
+  tour: { step: TourStep }   // walkthrough step, survives restarts
+  live: LiveState | null     // live request, for the "try it" step
   connect: string
+  keyCheck?: KeyCheck | null  // pasted key's check with its provider
   report: '' | 'sent' | 'failed'     // a bug report or feature request, after Send
   account: AccountState
   update: UpdateState
+  hotkey: HotkeyState
 }
 
 export const defaultIsland: IslandState = {
@@ -236,10 +289,14 @@ export const defaultIsland: IslandState = {
   transcript: '',
   answer: '',
   done: false,
+  speaking: false,
+  offer: null,
+  finished: null,
   steps: [],
   walkthrough: null,
   engine: null,
   error: '',
+  fixable: false,
   latencyMs: null,
   notch: { width: 200, height: 32, hasNotch: true },
   idleVisible: true,
@@ -253,7 +310,7 @@ export const defaultIsland: IslandState = {
 export const defaultMascot: MascotState = { mood: 'idle', level: 0, lean: 0, look: { x: 0, y: 0 }, label: '' }
 
 export const defaultSettings: SettingsState = {
-  version: '0.9.0',
+  version: '0.10.0',
   engines: [],
   depth: 'balanced',
   permissions: { screen: null, accessibility: null, microphone: null, speech: null },
@@ -262,16 +319,30 @@ export const defaultSettings: SettingsState = {
   keys: {},
   history: [],
   walkthroughs: true,
+  sounds: true,
   memory: null,
   companion: 'notch',
   stats: { actionsWeek: 0, answers: 0, minutesSaved: 0 },
   usage: null,
   onboarded: true,
+  tour: { step: 'welcome' },
+  live: null,
   connect: '',
   report: '',
-  account: { available: false, required: false },
-  update: { enabled: true, current: '0.9.0', available: null },
+  account: { available: false, identified: false, anonymous: false, prompt: false },
+  update: { enabled: true, current: '0.10.0', available: null },
+  hotkey: {
+    id: 'control+option', keys: ['⌃', '⌥'], label: 'Control + Option', works: true, owner: 'Plip',
+    choices: [
+      { id: 'control+option', keys: ['⌃', '⌥'], label: 'Control + Option' },
+      { id: 'option+command', keys: ['⌥', '⌘'], label: 'Option + Command' },
+      { id: 'control+shift', keys: ['⌃', '⇧'], label: 'Control + Shift' },
+      { id: 'control+command', keys: ['⌃', '⌘'], label: 'Control + Command' },
+    ],
+  },
 }
+
+export const defaultShortcut: Shortcut = { id: 'control+option', keys: ['⌃', '⌥'], label: 'Control + Option' }
 
 // -- tiny external store ------------------------------------------------------
 
@@ -303,6 +374,7 @@ export const island = new Store<IslandState>(defaultIsland)
 export const mascot = new Store<MascotState>(defaultMascot)
 export const settings = new Store<SettingsState>(defaultSettings)
 export const guide = new Store<GuideState>(defaultGuide)
+export const shortcut = new Store<Shortcut>(defaultShortcut)   // every "Hold ⌃⌥" follows it
 
 export function useStore<T extends object>(store: Store<T>): T {
   return useSyncExternalStore(store.subscribe, store.get, store.get)
@@ -315,6 +387,7 @@ export type Inbound =
   | { type: 'mascot'; state: Partial<MascotState> }
   | { type: 'settings'; state: Partial<SettingsState> }
   | { type: 'guide'; state: Partial<GuideState> }
+  | { type: 'shortcut'; state: Shortcut }
   | { type: 'append'; field: 'answer' | 'transcript'; text: string }
   | { type: 'step'; step: Step }
   | { type: 'reset' }
@@ -329,6 +402,13 @@ export function receive(message: Inbound) {
       break
     case 'settings':
       settings.set(message.state)
+      if (message.state.hotkey) {
+        const { id, keys, label } = message.state.hotkey
+        shortcut.set({ id, keys, label })
+      }
+      break
+    case 'shortcut':
+      shortcut.set(message.state)
       break
     case 'guide':
       guide.set(message.state)

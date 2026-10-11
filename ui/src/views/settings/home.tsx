@@ -2,7 +2,8 @@ import { motion } from 'motion/react'
 import { ArrowDownToLine, CalendarClock, Check, ChevronRight, Clock3, FolderSearch, Plane, Type, TrendingUp, WandSparkles, Zap } from 'lucide-react'
 import { send, type SettingsState } from '../../bridge'
 import { Mascot } from '../../components/Mascot'
-import { Keycap, cn } from '../../components/bits'
+import { Chord, cn } from '../../components/bits'
+import { SignInCard } from './account'
 import type { Tab } from './index'
 import { Button, Card, Section, Stat } from './ui'
 
@@ -28,7 +29,7 @@ export function HomeTab({ state, go }: { state: SettingsState; go: (tab: Tab) =>
   const known = (state.memory?.facts.length ?? 0) > 0
   const steps = [
     { label: 'Let Plip see and hear', done: permsReady, tab: 'permissions' as Tab, detail: 'Screen, Accessibility, Microphone' },
-    { label: 'Connect your AI', done: brainReady, tab: 'brain' as Tab, detail: engine ? `${engine.label} · ${engine.via}` : 'Use your Claude, ChatGPT, Cursor or Gemini plan' },
+    { label: 'Connect your AI', done: brainReady, tab: 'brain' as Tab, detail: brainReady && engine ? `${engine.label} · ${engine.via}` : 'Your Claude or ChatGPT plan, or free with Google' },
     { label: 'Tell Plip about you', done: known, tab: 'memory' as Tab, detail: known ? `${state.memory!.facts.length} things saved` : 'Import from Contacts, your browser, or ChatGPT' },
   ]
   const progress = steps.filter((step) => step.done).length / steps.length
@@ -38,6 +39,7 @@ export function HomeTab({ state, go }: { state: SettingsState; go: (tab: Tab) =>
 
   return (
     <div>
+      {state.account.prompt && <SignInCard state={state} />}
       {update && (
         <Card className="mb-6 flex items-center gap-4 glow-ring">
           <span className="grid size-9 shrink-0 place-items-center rounded-xl brand-gradient text-slate-950"><ArrowDownToLine className="size-4" /></span>
@@ -58,7 +60,7 @@ export function HomeTab({ state, go }: { state: SettingsState; go: (tab: Tab) =>
           <div className="mb-1 text-[13px] font-medium text-white/45">{greeting()}{first ? `, ${first}` : ''}</div>
           <h1 className="text-gradient text-[34px] font-semibold leading-[1.05] tracking-[-0.04em]">What should we get done?</h1>
           <div className="mt-3 flex items-center gap-2 text-[13px] text-white/50">
-            Hold <Keycap>⌃</Keycap><Keycap>⌥</Keycap> and ask, or tell Plip to do it for you.
+            Hold <Chord /> and ask, or tell Plip to do it for you.
           </div>
         </div>
       </div>
