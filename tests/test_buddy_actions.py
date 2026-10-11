@@ -66,17 +66,24 @@ def test_broken_action_tags_are_never_spoken():
 
 
 def test_yes_no_answers():
-    for text in ["yes", "Yeah do it", "sure, send it", "go ahead", "OK", "tidy up", "Yes, please.", "sure, no problem",
-                 "click it", "um, yeah, go ahead", "uh huh", "sure, why not"]:
+    for text in ["yes", "Yeah do it", "sure, send it", "go ahead", "OK", "tidy up"]:
         assert answer_kind(text) == "yes", text
     for text in ["no", "nope", "cancel that", "wait", "never mind", "don't"]:
         assert answer_kind(text) == "no", text
-    for text in ["what's the weather", "yesterday's file", "nobody knows", "okra recipes",
-                 "okay wait, don't send that", "yeah no", "ok hang on", "okay forget it", "sure, what's in it?",
+    for text in ["what's the weather", "yesterday's file", "nobody knows", "okra recipes"]:
+        assert answer_kind(text) == "", text
+
+
+def test_a_held_action_runs_only_on_a_plain_yes():
+    for text in ["yes", "Yeah do it", "sure, send it", "go ahead", "OK", "tidy up", "Yes, please.", "sure, no problem",
+                 "click it", "um, yeah, go ahead", "uh huh", "sure, why not"]:
+        assert answer_kind(text, held=True) == "yes", text
+    assert answer_kind("wait", held=True) == "no"
+    for text in ["okay wait, don't send that", "yeah no", "ok hang on", "okay forget it", "sure, what's in it?",
                  "yeah, send it to Sarah", "sure, but leave the screenshots out", "yes if it's under 50", "yes?",
                  "it", "um"]:
-        assert answer_kind(text) == "", text
-    assert answer_kind("go ahead, I don't mind") == ""      # a real yes with more to it: asks again, never runs wrong
+        assert answer_kind(text, held=True) == "", text
+    assert answer_kind("go ahead, I don't mind", held=True) == ""   # a yes with more to it: asks again, never wrong
 
 
 # -- skills --------------------------------------------------------------------------------

@@ -430,7 +430,7 @@ class Companion:
         if self.actions is not None and self.actions.pending is not None:
             from mcp_vision.buddy.actions import answer_kind
 
-            kind = answer_kind(transcript)
+            kind = answer_kind(transcript, held=True)
             if kind:
                 answered = await self._answer(kind == "yes", transcript)
                 if answered is not None:
