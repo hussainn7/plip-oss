@@ -74,6 +74,18 @@ def test_yes_no_answers():
         assert answer_kind(text) == "", text
 
 
+def test_a_held_action_runs_only_on_a_plain_yes():
+    for text in ["yes", "Yeah do it", "sure, send it", "go ahead", "OK", "tidy up", "Yes, please.", "sure, no problem",
+                 "click it", "um, yeah, go ahead", "uh huh", "sure, why not"]:
+        assert answer_kind(text, held=True) == "yes", text
+    assert answer_kind("wait", held=True) == "no"
+    for text in ["okay wait, don't send that", "yeah no", "ok hang on", "okay forget it", "sure, what's in it?",
+                 "yeah, send it to Sarah", "sure, but leave the screenshots out", "yes if it's under 50", "yes?",
+                 "it", "um"]:
+        assert answer_kind(text, held=True) == "", text
+    assert answer_kind("go ahead, I don't mind", held=True) == ""   # a yes with more to it: asks again, never wrong
+
+
 # -- skills --------------------------------------------------------------------------------
 
 def test_open_app_matches_names_aliases_and_typos():
@@ -350,6 +362,17 @@ def test_turn_asks_before_consequential_actions_and_voice_yes_runs_it(tmp_path):
     assert "tidied 10 files" in speaker.said[-1] and len(brain.calls) == 1      # no model call for the yes
     assert (tmp_path / "Desktop" / "Images" / "cat.jpg").exists()
     assert events.of("confirm")[-1] == {"cleared": True}
+
+
+def test_a_yes_with_more_to_it_goes_to_the_model_instead_of_running_the_held_action(tmp_path):
+    desktop(tmp_path)
+    brain = ScriptedBrain("I can tidy that. [DO:organize_desktop {}]")
+    buddy, events, speaker = companion(brain, tmp_path=tmp_path)
+    run(buddy.respond("clean up my desktop"))
+    result = run(buddy.respond("sure, but leave the screenshots out"))
+    assert result.did == [] and (tmp_path / "Desktop" / "cat.jpg").exists()
+    assert buddy.actions.pending is None and events.of("confirm")[-1] == {"cleared": True}
+    assert len(brain.calls) == 2 and "leave the screenshots out" in brain.calls[1][-1].text
 
 
 def test_new_question_clears_a_pending_action_and_buttons_work(tmp_path):
